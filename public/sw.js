@@ -1,4 +1,4 @@
-const CACHE_NAME = 'basket-shell-v2'
+const CACHE_NAME = 'basket-shell-v3'
 const APP_ROOT = new URL('./', self.registration.scope)
 const APP_SHELL = [APP_ROOT.href, new URL('manifest.webmanifest', APP_ROOT).href, new URL('basket-icon.svg', APP_ROOT).href]
 

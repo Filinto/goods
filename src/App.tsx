@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import { createWorker } from 'tesseract.js'
+import { progressMessage, recognizePriceTag } from './ocr'
 import {
   ArrowDownUp, ArrowLeft, ArrowRight, Check, CheckCircle2, Clock3, ImagePlus,
   LogOut, Minus, Plus, ScanLine, ShoppingBasket, Sparkles, Trash2, X, CircleHelp,
 } from 'lucide-react'
 import './App.css'
+import './ocr.css'
 
-type Item = { id: string; name: string; price: number; unitPrice: number | null; quantity: number; photo: string }
+type Item = { id: string; name: string; price: number; unitPrice: number | null; unitLabel?: 'kg' | 'L' | ''; quantity: number; photo: string }
 type Shopping = { id: string; name: string; createdAt: string; completedAt?: string; items: Item[] }
 type Profile = { email: string; salt: string; passwordHash: string }
-type Review = { name: string; price: string; unitPrice: string; quantity: string; photo: string }
+type Review = { name: string; price: string; unitPrice: string; unitLabel: 'kg' | 'L' | ''; quantity: string; photo: string; recognizedText: string }
 
 const SHOPPINGS_KEY = 'basket-shoppings-v1'
 const PROFILE_KEY = 'basket-profile-v1'
@@ -20,37 +21,6 @@ const readStored = <T,>(key: string, fallback: T): T => {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) as T : fallback } catch { return fallback }
 }
 const uid = () => crypto.randomUUID()
-
-function parseOcr(text: string) {
-  const lines = text.split(/\n+/).map(line => line.replace(/[^\p{L}\p{N}€£$.,:/% -]/gu, '').trim()).filter(Boolean)
-  const perKgLine = lines.find(line => /(?:\/\s?kg|per\s?kg|por\s?kg|kg\s?\/|€\s?\/\s?kg)/i.test(line)) ?? ''
-  const getPrice = (value: string) => {
-    const match = value.match(/(?:€|EUR|£|\$)?\s*(\d{1,4}(?:[.,]\d{1,2})?)/i)
-    if (!match) return ''
-    const normalized = match[1].includes(',') && !match[1].includes('.') ? match[1].replace(',', '.') : match[1].replace(/,/g, '')
-    return Number(normalized) > 0 ? Number(normalized).toFixed(2) : ''
-  }
-  const unitPrice = getPrice(perKgLine)
-  const priceLines = lines.filter(line => /[£€$]/.test(line) || /\d+[.,]\d{2}/.test(line))
-  const price = priceLines.map(getPrice).filter(Boolean).find(value => value !== unitPrice) ?? ''
-  const name = lines.find(line => /[a-zA-Z\p{L}]{3}/u.test(line) && !/[£€$]/.test(line) && !/(?:\/\s?kg|per\s?kg|por\s?kg|\b\d+\s?(?:g|kg|ml|l)\b)/i.test(line)) ?? ''
-  return { name: name.replace(/\s{2,}/g, ' '), price, unitPrice }
-}
-
-async function shrinkImage(file: File): Promise<string> {
-  const source = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const image = new Image()
-    image.onload = () => resolve(image)
-    image.onerror = reject
-    image.src = URL.createObjectURL(file)
-  })
-  const scale = Math.min(1, 1500 / source.width)
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.round(source.width * scale)
-  canvas.height = Math.round(source.height * scale)
-  canvas.getContext('2d')?.drawImage(source, 0, 0, canvas.width, canvas.height)
-  return canvas.toDataURL('image/jpeg', 0.78)
-}
 
 async function passwordDigest(password: string, salt: string) {
   const value = new TextEncoder().encode(`${salt}:${password}`)
@@ -120,18 +90,19 @@ function App() {
     if (!file) return
     setOcrBusy(true)
     setOcrMessage('A preparar a fotografia…')
+    let photo = ''
     try {
-      const photo = await shrinkImage(file)
-      setOcrMessage('A procurar o produto e o preço…')
-      const worker = await createWorker('por')
-      const result = await worker.recognize(photo)
-      await worker.terminate()
-      const detected = parseOcr(result.data.text)
-      setReview({ ...detected, quantity: '1', photo })
-      setToast(detected.name || detected.price ? 'Etiqueta analisada — confirme os dados.' : 'Fotografia pronta — introduza os dados manualmente.')
+      const detected = await recognizePriceTag(file, progress => {
+        if (progress.photo) photo = progress.photo
+        setOcrMessage(progressMessage(progress.status, progress.progress))
+      })
+      photo = detected.photo
+      setReview({ ...detected, quantity: '1' })
+      setToast(detected.name && detected.price ? 'Etiqueta analisada — confirme os dados.' : 'Etiqueta lida parcialmente — confirme e preencha os campos em falta.')
     } catch (error) {
       console.error('OCR falhou:', error)
-      setToast('Não foi possível analisar a fotografia. Introduza os dados manualmente.')
+      if (photo) setReview({ name: '', price: '', unitPrice: '', unitLabel: '', quantity: '1', photo, recognizedText: '' })
+      setToast(error instanceof Error ? error.message : 'Não foi possível ler a fotografia. Confirme ou introduza os dados manualmente.')
     } finally { setOcrBusy(false) }
   }
 
@@ -141,6 +112,7 @@ function App() {
     const item: Item = {
       id: uid(), name: review.name.trim(), price: Number(review.price),
       unitPrice: review.unitPrice ? Number(review.unitPrice) : null,
+      unitLabel: review.unitLabel,
       quantity: Math.max(1, Number.parseInt(review.quantity, 10) || 1), photo: review.photo,
     }
     updateShopping(active.id, shopping => ({ ...shopping, items: [...shopping.items, item] }))
@@ -184,7 +156,7 @@ function App() {
         <section className="page-heading"><div><span className="eyebrow"><span className="live-dot" /> A SUA LISTA, EM TEMPO REAL</span><h1>{active ? 'As minhas compras' : 'Pronto para começar?'}</h1><p>{active ? 'Tenha uma visão clara do que vai levar.' : 'Crie uma lista e mantenha a próxima compra sob controlo.'}</p></div>{active && <div className="date-chip"><Clock3 size={15} /> Iniciada {new Intl.DateTimeFormat('pt-PT', { day: 'numeric', month: 'short' }).format(new Date(active.createdAt))}</div>}</section>
         {!active ? <section className="empty-card"><div className="empty-illustration"><ShoppingBasket size={37} strokeWidth={1.5} /><span><Plus size={16} /></span></div><h2>A próxima compra começa aqui</h2><p>Crie uma lista nova e digitalize as etiquetas à medida que avança.</p><button className="primary-button" onClick={startShopping}>Criar lista de compras <ArrowRight size={17} /></button></section> : <div className="shopping-layout">
           <section className="list-panel"><div className="list-heading"><div><span className="section-label">LISTA ATUAL</span><h2>{active.name}</h2></div><button className="subtle-button" onClick={() => setShowHelp(true)}><CircleHelp size={16} /> Como funciona</button></div>
-            {active.items.length ? <div className="item-list">{active.items.map((item, index) => <article className="item-row" key={item.id}><div className="item-photo-wrap"><img className="item-photo" src={item.photo} alt={`Etiqueta de ${item.name}`} /><span className="item-index">{String(index + 1).padStart(2, '0')}</span></div><div className="item-info"><h3>{item.name}</h3><div className="item-meta">{item.unitPrice !== null && <span>{money(item.unitPrice)} / kg</span>}<span className="verified"><CheckCircle2 size={13} /> Confirmado</span></div></div><div className="quantity-control"><button aria-label={`Diminuir quantidade de ${item.name}`} onClick={() => changeQuantity(item.id, -1)}><Minus size={14} /></button><span>{item.quantity}</span><button aria-label={`Aumentar quantidade de ${item.name}`} onClick={() => changeQuantity(item.id, 1)}><Plus size={14} /></button></div><strong className="item-total">{money(item.price * item.quantity)}</strong><button className="remove-button" aria-label={`Remover ${item.name}`} onClick={() => removeItem(item.id)}><Trash2 size={16} /></button></article>)}</div> : <div className="list-empty"><span className="empty-scan-icon"><ScanLine size={22} /></span><div><h3>A lista está vazia</h3><p>Digitalize uma etiqueta de preço para adicionar o primeiro artigo.</p></div></div>}
+            {active.items.length ? <div className="item-list">{active.items.map((item, index) => <article className="item-row" key={item.id}><div className="item-photo-wrap"><img className="item-photo" src={item.photo} alt={`Etiqueta de ${item.name}`} /><span className="item-index">{String(index + 1).padStart(2, '0')}</span></div><div className="item-info"><h3>{item.name}</h3><div className="item-meta">{item.unitPrice !== null && <span>{money(item.unitPrice)} / {item.unitLabel === 'L' ? 'L' : 'kg'}</span>}<span className="verified"><CheckCircle2 size={13} /> Confirmado</span></div></div><div className="quantity-control"><button aria-label={`Diminuir quantidade de ${item.name}`} onClick={() => changeQuantity(item.id, -1)}><Minus size={14} /></button><span>{item.quantity}</span><button aria-label={`Aumentar quantidade de ${item.name}`} onClick={() => changeQuantity(item.id, 1)}><Plus size={14} /></button></div><strong className="item-total">{money(item.price * item.quantity)}</strong><button className="remove-button" aria-label={`Remover ${item.name}`} onClick={() => removeItem(item.id)}><Trash2 size={16} /></button></article>)}</div> : <div className="list-empty"><span className="empty-scan-icon"><ScanLine size={22} /></span><div><h3>A lista está vazia</h3><p>Digitalize uma etiqueta de preço para adicionar o primeiro artigo.</p></div></div>}
             <button className="scan-button" disabled={ocrBusy} onClick={() => fileInput.current?.click()}><ImagePlus size={19} /><span><strong>{active.items.length ? 'Digitalizar outro artigo' : 'Digitalizar etiqueta de preço'}</strong><small>Use a câmara ou escolha uma fotografia</small></span><ArrowRight size={18} className="scan-arrow" /></button><input ref={fileInput} className="visually-hidden" type="file" accept="image/*" capture="environment" onChange={processImage} />
             <div className="privacy-note"><span><Check size={14} /></span>As fotografias ficam guardadas neste dispositivo, juntamente com a lista.</div>
           </section>
@@ -196,7 +168,7 @@ function App() {
     <footer className="app-footer"><span>Pequenos passos, compras mais conscientes.</span><span>Feito para as suas compras do dia a dia <span className="footer-heart">♥</span></span></footer>
 
     {ocrBusy && <div className="overlay"><div className="scan-loading"><div className="scan-spinner"><ScanLine size={27} /></div><h2>Só um momento</h2><p>{ocrMessage}</p><div className="loading-track"><span /></div></div></div>}
-    {review && <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReview(null) }}><section className="review-modal" role="dialog" aria-modal="true" aria-labelledby="review-title"><div className="modal-header"><div><span className="eyebrow"><Sparkles size={13} /> ETIQUETA DIGITALIZADA</span><h2 id="review-title">Confirme o artigo</h2><p>Analisámos a etiqueta. Confirme se os dados estão corretos.</p></div><button className="close-button" aria-label="Fechar" onClick={() => setReview(null)}><X size={20} /></button></div><div className="review-photo"><img src={review.photo} alt="Fotografia da etiqueta de preço" /><div className="photo-scanned"><CheckCircle2 size={14} /> Fotografia captada</div></div><form onSubmit={confirmItem}><label>Nome do artigo<input autoFocus value={review.name} placeholder="ex.: leite gordo biológico" onChange={event => setReview({ ...review, name: event.target.value })} required /></label><div className="review-fields"><label>Preço<input type="number" min="0.01" step="0.01" inputMode="decimal" value={review.price} placeholder="0,00" onChange={event => setReview({ ...review, price: event.target.value })} required /></label><label>Preço por kg <span className="optional">Opcional</span><input type="number" min="0.01" step="0.01" inputMode="decimal" value={review.unitPrice} placeholder="0,00" onChange={event => setReview({ ...review, unitPrice: event.target.value })} /></label></div><label>Quantidade<input type="number" min="1" step="1" inputMode="numeric" value={review.quantity} onChange={event => setReview({ ...review, quantity: event.target.value })} required /></label><div className="review-actions"><button type="button" className="retake-button" onClick={() => { setReview(null); fileInput.current?.click() }}><ArrowDownUp size={16} /> Tirar outra fotografia</button><button className="primary-button" type="submit">Confirmar artigo <Check size={16} /></button></div></form><p className="review-tip"><CircleHelp size={14} /> Pode alterar os dados antes de adicionar o artigo.</p></section></div>}
+    {review && <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReview(null) }}><section className="review-modal" role="dialog" aria-modal="true" aria-labelledby="review-title"><div className="modal-header"><div><span className="eyebrow"><Sparkles size={13} /> ETIQUETA DIGITALIZADA</span><h2 id="review-title">Confirme o artigo</h2><p>Analisámos a etiqueta. Confirme se os dados estão corretos.</p></div><button className="close-button" aria-label="Fechar" onClick={() => setReview(null)}><X size={20} /></button></div><div className="review-photo"><img src={review.photo} alt="Fotografia da etiqueta de preço" /><div className="photo-scanned"><CheckCircle2 size={14} /> Fotografia captada</div></div>{review.recognizedText && <details className="ocr-transcript"><summary>Ver texto reconhecido</summary><pre>{review.recognizedText}</pre></details>}<form onSubmit={confirmItem}><label>Nome do artigo<input autoFocus value={review.name} placeholder="ex.: leite gordo biológico" onChange={event => setReview({ ...review, name: event.target.value })} required /></label><div className="review-fields"><label>Preço<input type="number" min="0.01" step="0.01" inputMode="decimal" value={review.price} placeholder="0,00" onChange={event => setReview({ ...review, price: event.target.value })} required /></label><label>Preço por {review.unitLabel || 'kg/L'} <span className="optional">Opcional</span><input type="number" min="0.01" step="0.01" inputMode="decimal" value={review.unitPrice} placeholder="0,00" onChange={event => setReview({ ...review, unitPrice: event.target.value })} /></label></div><label>Quantidade<input type="number" min="1" step="1" inputMode="numeric" value={review.quantity} onChange={event => setReview({ ...review, quantity: event.target.value })} required /></label><div className="review-actions"><button type="button" className="retake-button" onClick={() => { setReview(null); fileInput.current?.click() }}><ArrowDownUp size={16} /> Tirar outra fotografia</button><button className="primary-button" type="submit">Confirmar artigo <Check size={16} /></button></div></form><p className="review-tip"><CircleHelp size={14} /> Pode alterar os dados antes de adicionar o artigo.</p></section></div>}
     {showHelp && <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) setShowHelp(false) }}><section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title"><button className="close-button help-close" aria-label="Fechar" onClick={() => setShowHelp(false)}><X size={20} /></button><span className="help-icon"><ScanLine size={25} /></span><span className="eyebrow">GUIA RÁPIDO</span><h2 id="help-title">Compras simples e organizadas.</h2><div className="help-steps"><div><span>01</span><p><strong>Fotografe uma etiqueta de preço</strong>Use a câmara do telemóvel ou escolha uma fotografia.</p></div><div><span>02</span><p><strong>Confirme os dados</strong>Verifique os dados reconhecidos e corrija o que for necessário.</p></div><div><span>03</span><p><strong>Acompanhe o total</strong>Os artigos confirmados são adicionados ao total estimado.</p></div></div><button className="primary-button full-button" onClick={() => setShowHelp(false)}>Percebi <Check size={16} /></button></section></div>}
     {toast && <div className="toast"><CheckCircle2 size={17} /> {toast}</div>}
   </div>
@@ -204,7 +176,7 @@ function App() {
 
 function HistoryDetail({ shopping }: { shopping: Shopping }) {
   const total = shopping.items.reduce((sum, item) => sum + item.price * item.quantity, 0)
-  return <div className="history-detail"><div className="detail-summary"><span className="section-label">CONCLUÍDAS {new Intl.DateTimeFormat('pt-PT', { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(shopping.completedAt!)).toUpperCase()}</span><strong>{money(total)}</strong><span>total final da lista</span></div><div className="detail-items">{shopping.items.map(item => <div className="detail-item" key={item.id}><img src={item.photo} alt={`Etiqueta de ${item.name}`} /><div><strong>{item.name}</strong><span>Qtd. {item.quantity}{item.unitPrice !== null ? ` · ${money(item.unitPrice)} / kg` : ''}</span></div><strong>{money(item.price * item.quantity)}</strong></div>)}</div></div>
+  return <div className="history-detail"><div className="detail-summary"><span className="section-label">CONCLUÍDAS {new Intl.DateTimeFormat('pt-PT', { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(shopping.completedAt!)).toUpperCase()}</span><strong>{money(total)}</strong><span>total final da lista</span></div><div className="detail-items">{shopping.items.map(item => <div className="detail-item" key={item.id}><img src={item.photo} alt={`Etiqueta de ${item.name}`} /><div><strong>{item.name}</strong><span>Qtd. {item.quantity}{item.unitPrice !== null ? ` · ${money(item.unitPrice)} / ${item.unitLabel === 'L' ? 'L' : 'kg'}` : ''}</span></div><strong>{money(item.price * item.quantity)}</strong></div>)}</div></div>
 }
 
 export default App

@@ -14,7 +14,7 @@ Use `npm run build` para criar uma versão de produção e `npm run lint` para e
 ## Funcionalidades
 
 - Ecrãs de criação de conta e início de sessão para demonstração local.
-- Captura de fotografia e reconhecimento de texto (OCR) no navegador, com Tesseract.js em português.
+- Captura de fotografia e reconhecimento de texto (OCR) no navegador, com Tesseract.js em português e inglês.
 - Confirmação dos dados reconhecidos: nome do artigo, preço, preço por kg e quantidade antes de adicionar à lista.
 - Lista de compras, controlo de quantidades, total estimado, histórico de compras concluídas e criação de novas listas.
 - Interface responsiva para telemóvel e computador e uma versão PWA instalável básica.
@@ -24,7 +24,7 @@ Use `npm run build` para criar uma versão de produção e `npm run lint` para e
 
 - **As contas são apenas para demonstração e ficam neste dispositivo.** O e-mail e um hash da palavra-passe com salt são guardados no armazenamento do navegador. Não existe servidor, autenticação segura, recuperação de palavra-passe nem sincronização entre dispositivos. É necessário integrar um backend de autenticação antes de usar em produção.
 - As listas e fotografias comprimidas ficam no localStorage do navegador, neste dispositivo. A limpeza dos dados do navegador apaga essa informação e o espaço disponível é limitado.
-- O OCR é uma estimativa e pode exigir a transferência inicial do modelo de idioma. Confirme sempre os dados antes de adicionar um artigo. O total apresentado está em euros e não inclui descontos nem impostos.
+- O OCR é uma estimativa e pode exigir a transferência inicial dos modelos de português e inglês. Confirme sempre os dados antes de adicionar um artigo. O total apresentado está em euros e não inclui descontos nem impostos.
 - O service worker é registado nas versões de produção. O OCR pode precisar de ligação à Internet se o modelo ainda não tiver sido transferido.
 
 ## Publicar em semprecerto.com
