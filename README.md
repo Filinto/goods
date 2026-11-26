@@ -35,7 +35,8 @@ Para concluir a configuração:
 
 1. No GitHub, abra as definições do repositório, aceda a **Pages** e selecione **GitHub Actions** como origem da publicação.
 2. No Squarespace, configure os registos A do host `@` para os endereços de GitHub Pages: `185.199.108.153`, `185.199.109.153`, `185.199.110.153` e `185.199.111.153`.
-3. Atualize o domínio personalizado nas definições **Pages** do GitHub para `semprecerto.com`. Mantenha os registos MX e os restantes registos de e-mail. O host `www` não é alterado por esta configuração.
-4. Depois de o DNS propagar e o certificado ser emitido, ative **Enforce HTTPS**.
+3. Configure `www` como CNAME para `Filinto.github.io` e atualize o domínio personalizado nas definições **Pages** do GitHub para `semprecerto.com`.
+4. Mantenha os registos MX e os restantes registos de e-mail; remova os registos web Squarespace antigos de `@` e `www` para evitar conflitos.
+5. Depois de o DNS propagar e o certificado ser emitido, ative **Enforce HTTPS**.
 
 A propagação DNS pode demorar. O acesso à câmara exige HTTPS; não partilhe credenciais nem dados reais enquanto a autenticação e o armazenamento forem apenas demonstrações locais.
