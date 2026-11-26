@@ -26,3 +26,21 @@ Use `npm run build` para criar uma versão de produção e `npm run lint` para e
 - As listas e fotografias comprimidas ficam no localStorage do navegador, neste dispositivo. A limpeza dos dados do navegador apaga essa informação e o espaço disponível é limitado.
 - O OCR é uma estimativa e pode exigir a transferência inicial do modelo de idioma. Confirme sempre os dados antes de adicionar um artigo. O total apresentado está em euros e não inclui descontos nem impostos.
 - O service worker é registado nas versões de produção. O OCR pode precisar de ligação à Internet se o modelo ainda não tiver sido transferido.
+
+## Publicar em semprecerto.com
+
+O projeto é uma aplicação Vite estática. O Squarespace gere o domínio, mas não publica diretamente esta aplicação React; a publicação está configurada através do GitHub Pages. O workflow em `.github/workflows/deploy.yml` compila e publica cada atualização enviada para `main`, e `public/CNAME` define o domínio personalizado.
+
+Para concluir a configuração:
+
+1. No GitHub, abra as definições do repositório, aceda a **Pages** e selecione **GitHub Actions** como origem da publicação.
+2. No Squarespace, abra as definições DNS de `semprecerto.com` e adicione estes registos para o domínio raiz:
+   - A — Host `@` — `185.199.108.153`
+   - A — Host `@` — `185.199.109.153`
+   - A — Host `@` — `185.199.110.153`
+   - A — Host `@` — `185.199.111.153`
+   - CNAME — Host `www` — `Filinto.github.io`
+3. Remova registos A ou CNAME existentes para `@`/`www` que apontem para outro alojamento, se já não forem necessários. Não altere registos MX nem outros registos de e-mail.
+4. Depois de o DNS propagar e o primeiro workflow publicar o site, confirme `semprecerto.com` como domínio personalizado nas definições **Pages** do GitHub e ative **Enforce HTTPS** quando ficar disponível.
+
+A propagação DNS pode demorar. O acesso à câmara exige HTTPS; não partilhe credenciais nem dados reais enquanto a autenticação e o armazenamento forem apenas demonstrações locais.
