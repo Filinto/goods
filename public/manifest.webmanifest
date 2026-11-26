@@ -1,0 +1,17 @@
+{
+  "name": "Cesto — Lista de Compras",
+  "short_name": "Cesto",
+  "description": "Acompanhe as suas compras, etiqueta a etiqueta.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f8f5",
+  "theme_color": "#286442",
+  "icons": [
+    {
+      "src": "/basket-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
