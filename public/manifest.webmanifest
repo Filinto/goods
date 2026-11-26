@@ -8,7 +8,7 @@
   "theme_color": "#286442",
   "icons": [
     {
-      "src": "/basket-icon.svg",
+      "src": "basket-icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"

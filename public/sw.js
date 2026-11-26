@@ -1,5 +1,6 @@
 const CACHE_NAME = 'basket-shell-v2'
-const APP_SHELL = ['/', '/manifest.webmanifest', '/basket-icon.svg']
+const APP_ROOT = new URL('./', self.registration.scope)
+const APP_SHELL = [APP_ROOT.href, new URL('manifest.webmanifest', APP_ROOT).href, new URL('basket-icon.svg', APP_ROOT).href]
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(APP_SHELL)))
