@@ -29,7 +29,7 @@ Use `npm run build` para criar uma versão de produção e `npm run lint` para e
 
 ## Publicar em semprecerto.com
 
-O projeto é uma aplicação Vite estática. O Squarespace gere o domínio, mas não publica diretamente esta aplicação React; a publicação está configurada através do GitHub Pages. O workflow em `.github/workflows/deploy.yml` compila e publica cada atualização enviada para `main`, e `public/CNAME` define o domínio personalizado.
+O projeto é uma aplicação Vite estática. O Squarespace gere o domínio, mas não publica diretamente esta aplicação React; a publicação está configurada através do GitHub Pages. O workflow em `.github/workflows/deploy.yml` compila e publica cada atualização enviada para `main`, e `public/CNAME` define o domínio personalizado. Antes de concluir o DNS e o certificado HTTPS, o endereço temporário do site será `https://filinto.github.io/goods/`.
 
 Para concluir a configuração:
 
