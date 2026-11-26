@@ -27,16 +27,15 @@ Use `npm run build` para criar uma versão de produção e `npm run lint` para e
 - O OCR é uma estimativa e pode exigir a transferência inicial do modelo de idioma. Confirme sempre os dados antes de adicionar um artigo. O total apresentado está em euros e não inclui descontos nem impostos.
 - O service worker é registado nas versões de produção. O OCR pode precisar de ligação à Internet se o modelo ainda não tiver sido transferido.
 
-## Publicar em app.semprecerto.com
+## Publicar em semprecerto.com
 
-O projeto é uma aplicação Vite estática. O Squarespace gere o domínio, mas não publica diretamente esta aplicação React; a publicação está configurada através do GitHub Pages. O workflow em `.github/workflows/deploy.yml` compila e publica cada atualização enviada para `main`, e `public/CNAME` define o domínio personalizado. A aplicação ficará em `app.semprecerto.com`, mantendo o site Squarespace existente em `semprecerto.com` e `www.semprecerto.com`. O endereço temporário do site é `https://filinto.github.io/goods/`.
+O projeto é uma aplicação Vite estática publicada através do GitHub Pages. O workflow em `.github/workflows/deploy.yml` compila e publica cada atualização enviada para `main`, e `public/CNAME` define o domínio personalizado. A aplicação ficará em `semprecerto.com`, substituindo o site Squarespace que estava nesse domínio. O endereço temporário do site é `https://filinto.github.io/goods/`.
 
 Para concluir a configuração:
 
 1. No GitHub, abra as definições do repositório, aceda a **Pages** e selecione **GitHub Actions** como origem da publicação.
-2. No Squarespace, abra as definições DNS de `semprecerto.com` e adicione apenas este registo:
-   - CNAME — Host `app` — `Filinto.github.io`
-3. Mantenha os registos existentes para `@` e `www`, para não interromper o site Squarespace. Não altere registos MX nem outros registos de e-mail.
-4. Depois de o CNAME propagar, confirme `app.semprecerto.com` como domínio personalizado nas definições **Pages** do GitHub e ative **Enforce HTTPS** quando ficar disponível.
+2. No Squarespace, configure os registos A do host `@` para os endereços de GitHub Pages: `185.199.108.153`, `185.199.109.153`, `185.199.110.153` e `185.199.111.153`.
+3. Atualize o domínio personalizado nas definições **Pages** do GitHub para `semprecerto.com`. Mantenha os registos MX e os restantes registos de e-mail. O host `www` não é alterado por esta configuração.
+4. Depois de o DNS propagar e o certificado ser emitido, ative **Enforce HTTPS**.
 
 A propagação DNS pode demorar. O acesso à câmara exige HTTPS; não partilhe credenciais nem dados reais enquanto a autenticação e o armazenamento forem apenas demonstrações locais.
