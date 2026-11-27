@@ -186,7 +186,16 @@ describe('parseOcr', () => {
 
   it('reads the product, shelf price and per-kilogram price on a pizza tag', () => {
     expect(parseOcr('PIZZA PEPPERONI\nRISTORANTE 320G\n3,79 €\n11,84 €/KG\n4,99€ PVPR')).toEqual({
-      name: 'PIZZA PEPPERONI RISTORANTE 320G',
+      name: 'PIZZA PEPPERONI',
+      price: '3.79',
+      unitPrice: '11.84',
+      unitLabel: 'kg',
+    })
+  })
+
+  it('restores a missing large whole-number digit from unit price and package size', () => {
+    expect(parseOcr('PIZZA PEPPERONI\nRISTORANTE 320G\n79€\n11,84 €/KG')).toEqual({
+      name: 'PIZZA PEPPERONI',
       price: '3.79',
       unitPrice: '11.84',
       unitLabel: 'kg',

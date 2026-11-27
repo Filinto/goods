@@ -4,13 +4,14 @@ export type ParsedOcr = { name: string; price: string; unitPrice: string; unitLa
 export type OcrProgress = { status: string; progress: number; photo?: string }
 export type PriceTagResult = ParsedOcr & { photo: string; recognizedText: string; confidence: number }
 
-type OcrPass = { parsed: ParsedOcr; text: string; confidence: number; priceHeight: number; nameLength: number }
-type OcrLayoutWord = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }
+type OcrPass = { parsed: ParsedOcr; text: string; confidence: number; priceHeight: number; nameLength: number; packageSize: string; layoutLines: OcrLayoutLine[] }
+type OcrLayoutWord = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence?: number }
 type OcrLayoutLine = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; words?: OcrLayoutWord[] }
 
 const PRICE_TOKEN = /(?<![\d.,])(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?![\d.,])/g
 const UNIT_CUE = /(?:\/\s?(?:kg|l|lt)\b|\bpor\s?(?:kg|l|lt)\b|\bper\s?(?:kg|l|lt)\b|€\s?\/\s?(?:kg|l|lt)\b|\b(?:kg|l|lt)\s?\/)/i
 const WEIGHT_TOKEN = /\b\d+(?:[.,]\d+)?\s?(?:kg|g|mg|ml|cl|dl|l)\b/i
+const NON_PRODUCT_WORD = /^(?:OFERTA|PVP|PVPR|PYPR|PRE[CÇ]O|PRICE|TOTAL|UNIDADE|QUANTIDADE|PROMO[CÇ][AÃ]O|DESCONTO|MENOS|RECOMENDADO|RECOME|POUPAN[CÇ]A|OBRIGADO|VISITA|SOBRE|KG|LT|EUR)$/i
 
 function normalizeAmount(raw: string): string {
   let value = raw.replace(/\s/g, '')
@@ -54,6 +55,17 @@ function cleanLine(line: string): string {
     .replace(/[^\p{L}\p{N}€£$.,:/%&+'’()\-\s]/gu, ' ')
     .replace(/[ \t]+/g, ' ')
     .trim()
+}
+
+function productWordsInLine(line: OcrLayoutLine): OcrLayoutWord[] {
+  return (line.words ?? []).filter(word => {
+    const token = cleanLine(word.text).replace(/[^\p{L}\p{N}&'’-]/gu, '')
+    return /\p{L}{2}/u.test(token)
+      && token === token.toLocaleUpperCase()
+      && !NON_PRODUCT_WORD.test(token)
+      && (word.confidence === undefined || word.confidence >= 60)
+      && (!/^\d/.test(token) || WEIGHT_TOKEN.test(token))
+  })
 }
 
 function isNameLine(line: string): boolean {
@@ -137,8 +149,8 @@ function amountFromLayoutWords(layoutLines: OcrLayoutLine[]): Array<{ value: str
   return candidates
 }
 
-function correctUnitPrice(price: string, unitPrice: string, unitLabel: ParsedOcr['unitLabel'], name: string): string {
-  const packageSize = name.match(/\b(\d+(?:[.,]\d+)?)\s?(kg|g|mg|ml|cl|dl|l)\b/i)
+function correctUnitPrice(price: string, unitPrice: string, unitLabel: ParsedOcr['unitLabel'], name: string, layoutLines: OcrLayoutLine[] = [], fallbackText = ''): string {
+  const packageSize = packageSizeFrom(name, layoutLines) ?? fallbackText.match(/\b(\d+(?:[.,]\d+)?)\s?(kg|g|mg|ml|cl|dl|l)\b/i)
   if (!price || !unitPrice || !unitLabel || !packageSize) return unitPrice
 
   const quantity = Number(packageSize[1].replace(',', '.'))
@@ -153,6 +165,33 @@ function correctUnitPrice(price: string, unitPrice: string, unitLabel: ParsedOcr
   const printedUnitPrice = Number(unitPrice)
   const hundredFold = printedUnitPrice / expected >= 80 && printedUnitPrice / expected <= 120
   return matchesUnit && Number.isFinite(expected) && expected > 0 && hundredFold ? expected.toFixed(2) : unitPrice
+}
+
+function packageSizeFrom(name: string, layoutLines: OcrLayoutLine[] = []): RegExpMatchArray | null {
+  const expression = /\b(\d+(?:[.,]\d+)?)\s?(kg|g|mg|ml|cl|dl|l)\b/i
+  const fromName = name.match(expression)
+  if (fromName) return fromName
+  return layoutLines.flatMap(line => line.words ?? [])
+    .filter(word => (word.confidence ?? 0) >= 60)
+    .map(word => word.text.match(expression))
+    .find((match): match is RegExpMatchArray => Boolean(match)) ?? null
+}
+
+function shelfPriceFromUnit(unitPrice: string, unitLabel: ParsedOcr['unitLabel'], name: string, layoutLines: OcrLayoutLine[] = [], fallbackText = ''): string {
+  const packageSize = packageSizeFrom(name, layoutLines) ?? fallbackText.match(/\b(\d+(?:[.,]\d+)?)\s?(kg|g|mg|ml|cl|dl|l)\b/i)
+  if (!unitPrice || !unitLabel || !packageSize) return ''
+
+  const quantity = Number(packageSize[1].replace(',', '.'))
+  const packageUnit = packageSize[2].toLowerCase()
+  const matchesUnit = unitLabel === 'kg' ? ['kg', 'g', 'mg'].includes(packageUnit) : ['l', 'dl', 'cl', 'ml'].includes(packageUnit)
+  const baseQuantity = packageUnit === 'kg' || packageUnit === 'l' ? quantity
+    : packageUnit === 'g' || packageUnit === 'dl' ? quantity / 1000
+      : packageUnit === 'cl' ? quantity / 100
+        : packageUnit === 'mg' ? quantity / 1_000_000
+          : quantity / 1000
+  const amount = Number(unitPrice) * baseQuantity
+  if (!matchesUnit || !Number.isFinite(amount) || amount <= 0 || amount > 100_000) return ''
+  return (Math.round(amount * 100) / 100).toFixed(2)
 }
 
 export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): ParsedOcr {
@@ -198,22 +237,21 @@ export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): Parse
 
   const nameSource = layoutLines.length
     ? layoutLines.map(layoutLine => {
-      const productWords = layoutLine.words?.filter(word => {
-        const token = cleanLine(word.text)
-        const uppercase = token === token.toLocaleUpperCase()
-        return /\p{L}{2}/u.test(token) && (uppercase || WEIGHT_TOKEN.test(token))
-      })
-      const line = productWords?.length ? cleanLine(productWords.map(word => word.text).join(' ')) : cleanLine(layoutLine.text)
+      const productWords = productWordsInLine(layoutLine)
+      const line = productWords.length
+        ? cleanLine(productWords.map(word => word.text).join(' '))
+        : layoutLine.words?.length ? '' : cleanLine(layoutLine.text)
       const wordHeights = productWords?.map(word => word.bbox.y1 - word.bbox.y0) ?? []
-      return { line, y: layoutLine.bbox.y0, height: wordHeights.length ? Math.max(...wordHeights) : layoutLine.bbox.y1 - layoutLine.bbox.y0 }
+      const letters = [...line].filter(character => /\p{L}/u.test(character)).length
+      return { line, y: layoutLine.bbox.y0, height: wordHeights.length ? Math.max(...wordHeights) : layoutLine.bbox.y1 - layoutLine.bbox.y0, letters }
     })
-    : lines.map((line, index) => ({ line, y: index, height: 1 }))
+    : lines.map((line, index) => ({ line, y: index, height: 1, letters: [...line].filter(character => /\p{L}/u.test(character)).length }))
   const nameCandidates = nameSource
     .filter(candidate => isNameLine(candidate.line) && !/\bCONTINENTE(?:\s+BIO)?\b/i.test(candidate.line))
-    .sort((a, b) => b.height - a.height || a.y - b.y)
+    .sort((a, b) => b.letters - a.letters || b.height - a.height || a.y - b.y)
   const anchor = nameCandidates[0]
   const selectedNames = anchor
-    ? nameCandidates.filter(candidate => candidate.height >= anchor.height * 0.35 && (layoutLines.length === 0 || Math.abs(candidate.y - anchor.y) <= anchor.height * 4))
+    ? nameCandidates.filter(candidate => candidate.letters >= anchor.letters * 0.85 && candidate.height >= anchor.height * 0.75 && (layoutLines.length === 0 || Math.abs(candidate.y - anchor.y) <= anchor.height * 4))
     : []
   const name = (selectedNames.length ? selectedNames : nameCandidates.slice(0, 2))
     .sort((a, b) => a.y - b.y)
@@ -221,8 +259,12 @@ export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): Parse
     .map(candidate => candidate.line)
     .join(' ')
 
-  const adjustedUnitPrice = correctUnitPrice(price, unitPrice, unitLabel, name)
-  return { name, price, unitPrice: adjustedUnitPrice || (unitLabel && price ? price : ''), unitLabel }
+  const inferredPrice = shelfPriceFromUnit(unitPrice, unitLabel, name, layoutLines, text)
+  const relativePriceDifference = Math.abs(Number(price) - Number(inferredPrice)) / Math.max(Number(price), Number(inferredPrice))
+  const isWholeNumberPartial = Boolean(price) && Number(price) >= 10 && Number.isInteger(Number(price))
+  const completePrice = inferredPrice && (!price || isWholeNumberPartial || relativePriceDifference <= 0.25) ? inferredPrice : price
+  const adjustedUnitPrice = correctUnitPrice(completePrice, unitPrice, unitLabel, name, layoutLines, text)
+  return { name, price: completePrice, unitPrice: adjustedUnitPrice || (unitLabel && completePrice ? completePrice : ''), unitLabel }
 }
 
 function otsuThreshold(histogram: Uint32Array, pixelCount: number): number {
@@ -301,7 +343,7 @@ async function loadImage(file: File): Promise<{ image: CanvasImageSource; width:
   }
 }
 
-async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCanvasElement; enhanced: HTMLCanvasElement; priceCrop: HTMLCanvasElement; nameCrop: HTMLCanvasElement }> {
+async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCanvasElement; enhanced: HTMLCanvasElement }> {
   const decoded = await loadImage(file)
   try {
     const pixels = decoded.width * decoded.height
@@ -323,13 +365,7 @@ async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCa
     if (!photoContext) throw new Error('Canvas 2D context is unavailable')
     photoContext.drawImage(source, 0, 0, photoCanvas.width, photoCanvas.height)
 
-    return {
-      photo: photoCanvas.toDataURL('image/jpeg', 0.88),
-      source,
-      enhanced: makeOcrVariant(source),
-      priceCrop: makePriceCrop(decoded.image, decoded.width, decoded.height),
-      nameCrop: makeNameCrop(decoded.image, decoded.width, decoded.height),
-    }
+    return { photo: photoCanvas.toDataURL('image/jpeg', 0.88), source, enhanced: makeOcrVariant(source) }
   } finally {
     decoded.dispose()
   }
@@ -361,31 +397,33 @@ function makeTagCrops(source: HTMLCanvasElement): HTMLCanvasElement[] {
   })
 }
 
-function makePriceCrop(source: CanvasImageSource, sourceImageWidth: number, sourceImageHeight: number): HTMLCanvasElement {
-  const region = { x: 0.195, y: 0.414, width: 0.45, height: 0.256 }
-  const sourceX = Math.round(sourceImageWidth * region.x)
-  const sourceY = Math.round(sourceImageHeight * region.y)
-  const sourceWidth = Math.round(sourceImageWidth * region.width)
-  const sourceHeight = Math.round(sourceImageHeight * region.height)
-  const scale = Math.min(1.5, 1500 / Math.max(sourceWidth, sourceHeight))
-  const crop = document.createElement('canvas')
-  crop.width = Math.max(1, Math.round(sourceWidth * scale))
-  crop.height = Math.max(1, Math.round(sourceHeight * scale))
-  const context = crop.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.imageSmoothingEnabled = true
-  context.imageSmoothingQuality = 'high'
-  context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height)
-  return crop
-}
+function makeTagCrop(source: HTMLCanvasElement, layoutLines: OcrLayoutLine[]): HTMLCanvasElement | undefined {
+  const unitLine = layoutLines.find(line => UNIT_CUE.test(line.text))
+  const unitWord = unitLine?.words?.find(word => UNIT_CUE.test(word.text))
+  const titleLine = layoutLines
+    .filter(line => {
+      const words = productWordsInLine(line)
+      const averageConfidence = words.reduce((sum, word) => sum + (word.confidence ?? 0), 0) / Math.max(1, words.length)
+      const letters = words.map(word => word.text).join('').replace(/[^\p{L}]/gu, '').length
+      return words.length >= 2 && letters >= 8 && averageConfidence >= 50 && line.bbox.y0 < (unitLine?.bbox.y0 ?? source.height)
+    })
+    .sort((a, b) => a.bbox.y0 - b.bbox.y0)[0]
+  if (!unitLine || !titleLine) return undefined
 
-function makeNameCrop(source: CanvasImageSource, sourceImageWidth: number, sourceImageHeight: number): HTMLCanvasElement {
-  const region = { x: 0.20, y: 0.30, width: 0.40, height: 0.16 }
-  const sourceX = Math.round(sourceImageWidth * region.x)
-  const sourceY = Math.round(sourceImageHeight * region.y)
-  const sourceWidth = Math.round(sourceImageWidth * region.width)
-  const sourceHeight = Math.round(sourceImageHeight * region.height)
-  const scale = Math.min(1.5, 1500 / Math.max(sourceWidth, sourceHeight))
+  const titleWords = productWordsInLine(titleLine)
+  const titleLeft = Math.min(...titleWords.map(word => word.bbox.x0))
+  const titleRight = Math.max(...titleWords.map(word => word.bbox.x1))
+  const unitBounds = unitWord?.bbox ?? unitLine.bbox
+  const marginX = Math.round(source.width * 0.035)
+  const marginY = Math.round(source.height * 0.025)
+  const sourceX = Math.max(0, Math.min(titleLeft, unitBounds.x0) - marginX)
+  const sourceY = Math.max(0, titleLine.bbox.y0 - marginY)
+  const sourceRight = Math.min(source.width, Math.max(titleRight, unitBounds.x1) + marginX)
+  const sourceBottom = Math.min(source.height, unitBounds.y1 + marginY)
+  const sourceWidth = sourceRight - sourceX
+  const sourceHeight = sourceBottom - sourceY
+  if (sourceWidth < 20 || sourceHeight < 20) return undefined
+  const scale = Math.min(1.4, 2400 / Math.max(sourceWidth, sourceHeight))
   const crop = document.createElement('canvas')
   crop.width = Math.max(1, Math.round(sourceWidth * scale))
   crop.height = Math.max(1, Math.round(sourceHeight * scale))
@@ -424,13 +462,22 @@ export async function recognizePriceTag(file: File, onProgress: (progress: OcrPr
       const parsed = parseOcr(text, layoutLines)
       const priceHeight = Math.max(0, ...amountFromLayoutWords(layoutLines).filter(candidate => candidate.value === parsed.price).map(candidate => candidate.height))
       const nameLength = [...parsed.name].filter(character => /\p{L}/u.test(character)).length + (WEIGHT_TOKEN.test(parsed.name) ? 20 : 0)
-      passes.push({ parsed, text, confidence: result.data.confidence ?? 0, priceHeight, nameLength })
+      const packageSize = packageSizeFrom(parsed.name, layoutLines)?.[0] ?? ''
+      passes.push({ parsed, text, confidence: result.data.confidence ?? 0, priceHeight, nameLength, packageSize, layoutLines })
     }
 
     onProgress({ status: 'recognizing text', progress: 0.05 })
-    await run(prepared.priceCrop, PSM.SINGLE_BLOCK)
-    await run(prepared.nameCrop, PSM.SPARSE_TEXT)
     await run(prepared.source, PSM.SINGLE_BLOCK)
+    await run(prepared.source, PSM.SPARSE_TEXT)
+    const cropPass = [...passes]
+      .filter(pass => pass.parsed.name && pass.parsed.unitLabel)
+      .sort((a, b) => passScore(b) - passScore(a))[0]
+    const detectedTag = cropPass ? makeTagCrop(prepared.source, cropPass.layoutLines) : undefined
+    if (detectedTag) {
+      onProgress({ status: 'cropping label', progress: 0.15 })
+      await run(detectedTag, PSM.SINGLE_BLOCK)
+      await run(detectedTag, PSM.SPARSE_TEXT)
+    }
     let best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
 
     if ((!best.parsed.name || !best.parsed.price) || best.confidence < 92) {
@@ -457,14 +504,36 @@ export async function recognizePriceTag(file: File, onProgress: (progress: OcrPr
 
     const pricePass = [...passes].filter(pass => pass.parsed.price).sort((a, b) => b.priceHeight - a.priceHeight || b.confidence - a.confidence)[0]
     const namePass = [...passes].filter(pass => pass.parsed.name).sort((a, b) => b.nameLength - a.nameLength || b.confidence - a.confidence)[0]
-    const unitPass = [...passes].filter(pass => pass.parsed.unitLabel).sort((a, b) => Number(Boolean(b.parsed.unitPrice)) - Number(Boolean(a.parsed.unitPrice)) || b.confidence - a.confidence)[0]
+    const unitPass = [...passes].filter(pass => pass.parsed.unitLabel).sort((a, b) => {
+      const aHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(a.text)
+      const bHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(b.text)
+      return Number(bHasDecimal) - Number(aHasDecimal) || b.confidence - a.confidence
+    })[0]
     const merged: ParsedOcr = {
       name: namePass?.parsed.name || best.parsed.name,
       price: pricePass?.parsed.price || best.parsed.price,
       unitPrice: unitPass?.parsed.unitPrice || '',
       unitLabel: unitPass?.parsed.unitLabel || '',
     }
-    merged.unitPrice = correctUnitPrice(merged.price, merged.unitPrice, merged.unitLabel, merged.name)
+    const nameOccurrences = new Map<string, number>()
+    for (const pass of passes) {
+      for (const token of new Set(pass.parsed.name.toLocaleUpperCase().split(/\s+/).filter(Boolean))) {
+        nameOccurrences.set(token, (nameOccurrences.get(token) ?? 0) + 1)
+      }
+    }
+    if (passes.filter(pass => pass.parsed.name).length > 1 && merged.name) {
+      merged.name = merged.name.split(/\s+/).filter(token => (nameOccurrences.get(token.toLocaleUpperCase()) ?? 0) >= 2).join(' ')
+        || namePass?.parsed.name
+        || best.parsed.name
+    }
+    const packageLayout = passes.find(pass => pass.packageSize)?.layoutLines ?? []
+    const inferredPrice = shelfPriceFromUnit(merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
+    const relativePriceDifference = Math.abs(Number(merged.price) - Number(inferredPrice)) / Math.max(Number(merged.price), Number(inferredPrice))
+    const isWholeNumberPartial = Boolean(merged.price) && Number(merged.price) >= 10 && Number.isInteger(Number(merged.price))
+    if (inferredPrice && (!merged.price || isWholeNumberPartial || relativePriceDifference <= 0.25)) {
+      merged.price = inferredPrice
+    }
+    merged.unitPrice = correctUnitPrice(merged.price, merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
     return { ...merged, photo: prepared.photo, recognizedText: best.text, confidence: best.confidence }
   } finally {
     await worker?.terminate()
