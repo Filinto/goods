@@ -15,13 +15,13 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET' || new URL(event.request.url).origin !== self.location.origin) return
   if (event.request.mode === 'navigate') {
-    event.respondWith(fetch(event.request).then(response => {
+    const networkResponse = fetch(event.request)
+    event.waitUntil(networkResponse.then(response => {
       if (response.ok) {
-        const copy = response.clone()
-        event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)))
+        return caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()))
       }
-      return response
-    }).catch(async () => {
+    }).catch(() => undefined))
+    event.respondWith(networkResponse.catch(async () => {
       const cached = await caches.match(event.request)
       if (cached) return cached
       return caches.match(APP_ROOT.href)
@@ -30,7 +30,7 @@ self.addEventListener('fetch', event => {
   }
 
   event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request).then(response => {
-    if (response.ok) event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone())))
+    if (response.ok) caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()))
     return response
   })))
 })
