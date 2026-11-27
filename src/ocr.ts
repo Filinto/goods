@@ -60,7 +60,8 @@ function cleanLine(line: string): string {
 function productWordsInLine(line: OcrLayoutLine): OcrLayoutWord[] {
   return (line.words ?? []).filter(word => {
     const token = cleanLine(word.text).replace(/[^\p{L}\p{N}&'’-]/gu, '')
-    return /\p{L}{2}/u.test(token)
+    const letters = [...token].filter(character => /\p{L}/u.test(character)).length
+    return (letters >= 3 || (letters >= 2 && (word.confidence ?? 0) >= 85) || WEIGHT_TOKEN.test(token))
       && token === token.toLocaleUpperCase()
       && !NON_PRODUCT_WORD.test(token)
       && (word.confidence === undefined || word.confidence >= 60)
@@ -70,6 +71,7 @@ function productWordsInLine(line: OcrLayoutLine): OcrLayoutWord[] {
 
 function isNameLine(line: string): boolean {
   if ([...line].filter(char => /\p{L}/u.test(char)).length < 3) return false
+  if (!line.split(/\s+/).some(token => [...token].filter(char => /\p{L}/u.test(char)).length >= 3)) return false
   if (/[€£$]/.test(line) || UNIT_CUE.test(line)) return false
   if (/\b(?:oferta|pvp|pvpr|pypr|pre[cç]o(?:\s+por)?|price|total|unidade|quantidade|promo[cç][aã]o|desconto|por\s+(?:kg|l|lt)|menos|recomendado|recome|poupan[cç]a|obrigado|visita|sobre)\b/i.test(line)) return false
   if (amountsIn(line).length && !/[a-z]{3}/i.test(line)) return false
@@ -89,6 +91,13 @@ function amountFontHeight(lineIndex: number, value: string, layoutLines: OcrLayo
 
 function amountFromLayoutWords(layoutLines: OcrLayoutLine[]): Array<{ value: string; height: number; line: string }> {
   const candidates: Array<{ value: string; height: number; line: string }> = []
+  const numericWords = layoutLines.flatMap(layoutLine => {
+    if (UNIT_CUE.test(cleanLine(layoutLine.text))) return []
+    return (layoutLine.words ?? []).flatMap(word => {
+      const digits = word.text.replace(/\D/g, '')
+      return digits ? [{ digits, height: word.bbox.y1 - word.bbox.y0, bbox: word.bbox, line: cleanLine(layoutLine.text) }] : []
+    })
+  }).sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0)
 
   for (const layoutLine of layoutLines) {
     const line = cleanLine(layoutLine.text)
@@ -146,6 +155,29 @@ function amountFromLayoutWords(layoutLines: OcrLayoutLine[]): Array<{ value: str
     saveGroup()
   }
 
+  for (const leading of numericWords) {
+    if (leading.digits.length !== 1) continue
+    const followingCandidates = numericWords.filter(word => {
+      if (word.digits.length !== 2) return false
+      const height = Math.max(leading.height, word.height)
+      const gap = word.bbox.x0 - leading.bbox.x1
+      const overlap = Math.min(leading.bbox.y1, word.bbox.y1) - Math.max(leading.bbox.y0, word.bbox.y0)
+      const overlapRatio = overlap / Math.min(leading.height, word.height)
+      const sizeRatio = height / Math.min(leading.height, word.height)
+      const horizontalPair = gap >= 0 && gap <= height * 0.55 && overlapRatio >= 0.25
+      const verticallyStackedPair = Math.abs(word.bbox.x0 - leading.bbox.x0) <= height * 0.5
+        && Math.abs(word.bbox.y0 - leading.bbox.y0) <= height * 0.8
+      return (horizontalPair || verticallyStackedPair) && sizeRatio >= 1.35
+    }).sort((a, b) => Math.abs(a.bbox.x0 - leading.bbox.x0) + Math.abs(a.bbox.y0 - leading.bbox.y0)
+      - Math.abs(b.bbox.x0 - leading.bbox.x0) - Math.abs(b.bbox.y0 - leading.bbox.y0))
+    const following = followingCandidates[0]
+    if (following) {
+      const height = Math.max(leading.height, following.height)
+      const value = normalizeAmount(`${leading.digits}.${following.digits}`)
+      if (value) candidates.push({ value, height, line: `${leading.line} ${following.line}`.trim() })
+    }
+  }
+
   return candidates
 }
 
@@ -196,18 +228,20 @@ function shelfPriceFromUnit(unitPrice: string, unitLabel: ParsedOcr['unitLabel']
 
 export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): ParsedOcr {
   const lines = text.split(/[\r\n]+/).map(cleanLine).filter(Boolean)
-  const unitLine = lines.find(line => UNIT_CUE.test(line)) ?? ''
+  const unitLine = lines.find(line => UNIT_CUE.test(line) || /^\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\s*$/i.test(line)) ?? ''
   const unitIndex = lines.indexOf(unitLine)
   const unitAmounts = amountsIn(unitLine)
   if (!unitAmounts.length && unitIndex >= 0) {
-    unitAmounts.push(...amountsIn(lines[unitIndex - 1] ?? ''), ...amountsIn(lines[unitIndex + 1] ?? ''))
+    const adjacentLines = [lines[unitIndex - 1] ?? '', lines[unitIndex + 1] ?? '']
+      .filter(line => !/[€£$]/.test(line) && !UNIT_CUE.test(line) && /\d+[.,]\d{1,2}/.test(line))
+    unitAmounts.push(...adjacentLines.flatMap(amountsIn))
   }
   const unitCueIndex = unitLine.match(UNIT_CUE)?.index
   const selectedUnitAmount = unitAmounts.length && unitCueIndex !== undefined
     ? [...unitAmounts].sort((a, b) => Math.abs(a.index - unitCueIndex) - Math.abs(b.index - unitCueIndex))[0]
     : unitAmounts.at(-1)
   const unitPrice = selectedUnitAmount?.value ?? ''
-  const unitLabel: ParsedOcr['unitLabel'] = /(?:kg)/i.test(unitLine) ? 'kg' : /(?:\/\s?(?:l|lt)\b|\b(?:l|lt)\s?\/)/i.test(unitLine) ? 'L' : ''
+  const unitLabel: ParsedOcr['unitLabel'] = /\bkg\b/i.test(unitLine) ? 'kg' : /\b(?:l|lt)\b/i.test(unitLine) ? 'L' : ''
 
   const priceCandidates = lines.flatMap((line, lineIndex) => {
     if (UNIT_CUE.test(line)) return []
@@ -247,11 +281,19 @@ export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): Parse
     })
     : lines.map((line, index) => ({ line, y: index, height: 1, letters: [...line].filter(character => /\p{L}/u.test(character)).length }))
   const nameCandidates = nameSource
-    .filter(candidate => isNameLine(candidate.line) && !/\bCONTINENTE(?:\s+BIO)?\b/i.test(candidate.line))
+    .filter(candidate => isNameLine(candidate.line))
+    .filter(candidate => !/^CONTINENTE(?:\s+BIO)?$/i.test(candidate.line) || nameSource.some(other => other !== candidate && isNameLine(other.line)))
     .sort((a, b) => b.letters - a.letters || b.height - a.height || a.y - b.y)
   const anchor = nameCandidates[0]
   const selectedNames = anchor
-    ? nameCandidates.filter(candidate => candidate.letters >= anchor.letters * 0.85 && candidate.height >= anchor.height * 0.75 && (layoutLines.length === 0 || Math.abs(candidate.y - anchor.y) <= anchor.height * 4))
+    ? nameCandidates.filter(candidate => {
+      const nearAnchor = layoutLines.length === 0 || Math.abs(candidate.y - anchor.y) <= anchor.height * 4
+      const similarSize = candidate.letters >= anchor.letters * 0.85 && candidate.height >= anchor.height * 0.75
+      const continentesTag = nameCandidates.some(line => /\bCONTINENTE\b/i.test(line.line))
+      const relatedProductLine = continentesTag
+        && candidate.letters >= Math.min(5, anchor.letters * 0.55) && candidate.height >= anchor.height * 0.45
+      return nearAnchor && (similarSize || relatedProductLine)
+    })
     : []
   const name = (selectedNames.length ? selectedNames : nameCandidates.slice(0, 2))
     .sort((a, b) => a.y - b.y)
@@ -262,9 +304,14 @@ export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): Parse
   const inferredPrice = shelfPriceFromUnit(unitPrice, unitLabel, name, layoutLines, text)
   const relativePriceDifference = Math.abs(Number(price) - Number(inferredPrice)) / Math.max(Number(price), Number(inferredPrice))
   const isWholeNumberPartial = Boolean(price) && Number(price) >= 10 && Number.isInteger(Number(price))
-  const completePrice = inferredPrice && (!price || isWholeNumberPartial || relativePriceDifference <= 0.25) ? inferredPrice : price
-  const adjustedUnitPrice = correctUnitPrice(completePrice, unitPrice, unitLabel, name, layoutLines, text)
-  return { name, price: completePrice, unitPrice: adjustedUnitPrice || (unitLabel && completePrice ? completePrice : ''), unitLabel }
+  const completePrice = inferredPrice && (!price || isWholeNumberPartial || relativePriceDifference <= 0.25)
+    ? inferredPrice
+    : price || (unitPrice && unitLabel ? unitPrice : '')
+  const explicitUnitCue = /(?:€\s*\/\s*(?:kg|l|lt)\b|\/\s*(?:kg|l|lt)\b|\bper\s*(?:kg|l|lt)\b|\bpor\s*(?:kg|l|lt)\b)/i.test(unitLine)
+  const hasPrintedUnitDecimals = /\d+[.,]\d{1,2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(unitLine)
+  const selectedUnitPrice = explicitUnitCue && !unitPrice && !hasPrintedUnitDecimals && completePrice ? completePrice : unitPrice
+  const adjustedUnitPrice = correctUnitPrice(completePrice, selectedUnitPrice, unitLabel, name, layoutLines, text)
+  return { name, price: completePrice, unitPrice: adjustedUnitPrice, unitLabel }
 }
 
 function otsuThreshold(histogram: Uint32Array, pixelCount: number): number {
@@ -377,6 +424,26 @@ function makeTagCrops(source: HTMLCanvasElement): HTMLCanvasElement[] {
     { x: 0.12, y: 0.22, width: 0.78, height: 0.60 },
     { x: 0.06, y: 0.08, width: 0.88, height: 0.84 },
     { x: 0.02, y: 0.14, width: 0.96, height: 0.70 },
+    { x: 0.02, y: 0.30, width: 0.96, height: 0.62 },
+    { x: 0.02, y: 0.40, width: 0.96, height: 0.52 },
+    { x: 0.02, y: 0.22, width: 0.96, height: 0.76 },
+    { x: 0.00, y: 0.34, width: 1.00, height: 0.48 },
+    { x: 0.03, y: 0.20, width: 0.94, height: 0.34 },
+    { x: 0.03, y: 0.42, width: 0.94, height: 0.48 },
+    { x: 0.04, y: 0.27, width: 0.78, height: 0.19 },
+    { x: 0.05, y: 0.40, width: 0.72, height: 0.30 },
+    { x: 0.34, y: 0.58, width: 0.62, height: 0.25 },
+    { x: 0.00, y: 0.35, width: 1.00, height: 0.65 },
+    { x: 0.12, y: 0.38, width: 0.82, height: 0.58 },
+    { x: 0.32, y: 0.48, width: 0.68, height: 0.45 },
+    { x: 0.48, y: 0.48, width: 0.52, height: 0.45 },
+    { x: 0.08, y: 0.28, width: 0.55, height: 0.14 },
+    { x: 0.08, y: 0.40, width: 0.50, height: 0.30 },
+    { x: 0.43, y: 0.57, width: 0.50, height: 0.16 },
+    { x: 0.07, y: 0.17, width: 0.72, height: 0.18 },
+    { x: 0.07, y: 0.24, width: 0.78, height: 0.18 },
+    { x: 0.08, y: 0.40, width: 0.66, height: 0.40 },
+    { x: 0.52, y: 0.79, width: 0.46, height: 0.17 },
   ]
 
   return regions.map(region => {
@@ -395,6 +462,123 @@ function makeTagCrops(source: HTMLCanvasElement): HTMLCanvasElement[] {
     context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height)
     return crop
   })
+}
+
+function makeGrayVariant(source: HTMLCanvasElement): HTMLCanvasElement {
+  const variant = document.createElement('canvas')
+  variant.width = source.width
+  variant.height = source.height
+  const context = variant.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+  context.drawImage(source, 0, 0)
+  const image = context.getImageData(0, 0, source.width, source.height)
+  for (let i = 0; i < image.data.length; i += 4) {
+    const gray = Math.max(0, Math.min(255, Math.round(0.299 * image.data[i] + 0.587 * image.data[i + 1] + 0.114 * image.data[i + 2])))
+    const enhanced = Math.max(0, Math.min(255, Math.round((gray - 128) * 1.6 + 128)))
+    image.data[i] = enhanced
+    image.data[i + 1] = enhanced
+    image.data[i + 2] = enhanced
+  }
+  context.putImageData(image, 0, 0)
+  return variant
+}
+
+function makeBlueChannelVariant(source: HTMLCanvasElement): HTMLCanvasElement {
+  const variant = document.createElement('canvas')
+  variant.width = source.width
+  variant.height = source.height
+  const context = variant.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+  context.drawImage(source, 0, 0)
+  const image = context.getImageData(0, 0, source.width, source.height)
+  for (let i = 0; i < image.data.length; i += 4) {
+    const enhanced = Math.max(0, Math.min(255, Math.round((image.data[i + 2] - 112) * 1.8 + 128)))
+    image.data[i] = enhanced
+    image.data[i + 1] = enhanced
+    image.data[i + 2] = enhanced
+  }
+  context.putImageData(image, 0, 0)
+  return variant
+}
+
+function makeRedChannelVariant(source: HTMLCanvasElement): HTMLCanvasElement {
+  const variant = document.createElement('canvas')
+  variant.width = source.width
+  variant.height = source.height
+  const context = variant.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+  context.drawImage(source, 0, 0)
+  const image = context.getImageData(0, 0, source.width, source.height)
+  for (let i = 0; i < image.data.length; i += 4) {
+    const enhanced = Math.max(0, Math.min(255, Math.round((image.data[i] - 130) * 1.65 + 128)))
+    image.data[i] = enhanced
+    image.data[i + 1] = enhanced
+    image.data[i + 2] = enhanced
+  }
+  context.putImageData(image, 0, 0)
+  return variant
+}
+
+function makeAdaptiveVariant(source: HTMLCanvasElement): HTMLCanvasElement {
+  const variant = document.createElement('canvas')
+  variant.width = source.width
+  variant.height = source.height
+  const context = variant.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+  context.drawImage(source, 0, 0)
+  const image = context.getImageData(0, 0, source.width, source.height)
+  const width = source.width
+  const height = source.height
+  const gray = new Uint8Array(width * height)
+  const integral = new Float64Array((width + 1) * (height + 1))
+
+  for (let y = 0; y < height; y++) {
+    let rowSum = 0
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 4
+      const value = Math.round(0.299 * image.data[offset] + 0.587 * image.data[offset + 1] + 0.114 * image.data[offset + 2])
+      gray[y * width + x] = value
+      rowSum += value
+      integral[(y + 1) * (width + 1) + x + 1] = integral[y * (width + 1) + x + 1] + rowSum
+    }
+  }
+
+  const radius = Math.max(12, Math.round(Math.min(width, height) * 0.012))
+  for (let y = 0; y < height; y++) {
+    const top = Math.max(0, y - radius)
+    const bottom = Math.min(height - 1, y + radius)
+    for (let x = 0; x < width; x++) {
+      const left = Math.max(0, x - radius)
+      const right = Math.min(width - 1, x + radius)
+      const area = (right - left + 1) * (bottom - top + 1)
+      const sum = integral[(bottom + 1) * (width + 1) + right + 1] - integral[top * (width + 1) + right + 1]
+        - integral[(bottom + 1) * (width + 1) + left] + integral[top * (width + 1) + left]
+      const threshold = sum / area - 10
+      const value = gray[y * width + x] < threshold ? 0 : 255
+      const offset = (y * width + x) * 4
+      image.data[offset] = value
+      image.data[offset + 1] = value
+      image.data[offset + 2] = value
+      image.data[offset + 3] = 255
+    }
+  }
+  context.putImageData(image, 0, 0)
+  return variant
+}
+
+function rotateCanvas(source: HTMLCanvasElement, degrees: number): HTMLCanvasElement {
+  const radians = degrees * Math.PI / 180
+  const width = Math.ceil(Math.abs(source.width * Math.cos(radians)) + Math.abs(source.height * Math.sin(radians)))
+  const height = Math.ceil(Math.abs(source.height * Math.cos(radians)) + Math.abs(source.width * Math.sin(radians)))
+  const rotated = document.createElement('canvas')
+  rotated.width = width
+  rotated.height = height
+  const context = rotated.getContext('2d')
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+  context.translate(width / 2, height / 2)
+  context.rotate(radians)
+  context.drawImage(source, -source.width / 2, -source.height / 2)
+  return rotated
 }
 
 function makeTagCrop(source: HTMLCanvasElement, layoutLines: OcrLayoutLine[]): HTMLCanvasElement | undefined {
@@ -440,6 +624,30 @@ function passScore(pass: OcrPass): number {
   return (name ? 10 : 0) + (price ? 10 : 0) + (unitPrice ? 2 : 0) + Math.max(0, pass.confidence) / 100 + pass.priceHeight / 1000 + pass.nameLength / 1000
 }
 
+function sanitizeMergedFields(parsed: ParsedOcr, passes: OcrPass[]): ParsedOcr {
+  const result = { ...parsed }
+  const packageSize = passes.find(pass => packageSizeFrom(pass.parsed.name, pass.layoutLines))
+  const photoSuggestsFreshProduce = passes.some(pass => /(?:\bKG\b|€\s*\/\s*KG)/i.test(pass.text))
+    && !passes.some(pass => WEIGHT_TOKEN.test(pass.parsed.name) && !/\b(?:BIO|GM|G)\b/i.test(pass.parsed.name))
+  const nameHasEvidence = passes.some(pass => pass.parsed.name === result.name && pass.confidence >= 55)
+  if (!nameHasEvidence) result.name = ''
+
+  const explicitPricePass = passes.find(pass => pass.parsed.price === result.price
+    && pass.text.split(/[\r\n]+/).some(line => amountsIn(line).some(amount => amount.value === result.price && /[.,]\d{1,2}/.test(amount.raw))))
+  const geometryPricePass = passes.find(pass => pass.parsed.price === result.price && pass.priceHeight >= 80)
+  if (!explicitPricePass && !geometryPricePass) result.price = ''
+  const packagePriceEvidence = passes.some(pass => pass.parsed.price && pass.priceHeight >= 80)
+  const storeLabel = passes.some(pass => /\bCONTINENTE\b/i.test(pass.text))
+  if (result.price && !packagePriceEvidence && !packageSize && Number(result.price) > (storeLabel ? 5 : 50)) result.price = ''
+  if (result.price && photoSuggestsFreshProduce && Number(result.price) > 10) result.price = ''
+
+  if (result.unitPrice && !passes.some(pass => pass.parsed.unitPrice === result.unitPrice && pass.confidence >= 50)) {
+    result.unitPrice = ''
+  }
+  if (!result.price) result.unitPrice = ''
+  return result
+}
+
 export async function recognizePriceTag(file: File, onProgress: (progress: OcrProgress) => void = () => {}): Promise<PriceTagResult> {
   if (!file.type.startsWith('image/')) throw new Error('Escolha um ficheiro de imagem.')
   if (file.size > 20 * 1024 * 1024) throw new Error('A fotografia deve ter menos de 20 MB.')
@@ -454,8 +662,14 @@ export async function recognizePriceTag(file: File, onProgress: (progress: OcrPr
     await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK, preserve_interword_spaces: '1', user_defined_dpi: '300' })
 
     const passes: OcrPass[] = []
-    const run = async (image: HTMLCanvasElement, psm: typeof PSM.SINGLE_BLOCK | typeof PSM.SPARSE_TEXT) => {
+    const run = async (
+      image: HTMLCanvasElement,
+      psm: typeof PSM.SINGLE_BLOCK | typeof PSM.SPARSE_TEXT | typeof PSM.SINGLE_LINE | typeof PSM.SINGLE_WORD,
+      whitelist = '',
+    ) => {
       await worker!.setParameters({ tessedit_pageseg_mode: psm })
+      if (whitelist) await worker!.setParameters({ tessedit_char_whitelist: whitelist })
+      else await worker!.setParameters({ tessedit_char_whitelist: '' })
       const result = await worker!.recognize(image, { rotateAuto: true }, { blocks: true })
       const text = result.data.text.trim()
       const layoutLines = result.data.blocks?.flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines)) ?? []
@@ -480,41 +694,136 @@ export async function recognizePriceTag(file: File, onProgress: (progress: OcrPr
     }
     let best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
 
-    if ((!best.parsed.name || !best.parsed.price) || best.confidence < 92) {
-      const crops = makeTagCrops(prepared.source)
-      for (let index = 0; index < crops.length; index++) {
-        onProgress({ status: 'cropping label', progress: 0.15 + index * 0.12 })
-        await run(crops[index], PSM.SINGLE_BLOCK)
+    const hasGoodFields = (pass: OcrPass) => {
+      const nameLetters = [...pass.parsed.name].filter(character => /\p{L}/u.test(character)).length
+      const hasUnitCue = Boolean(pass.parsed.unitLabel) || /(?:\/\s?kg|€\s?\/\s?kg|\bkg\b|\/\s?(?:l|lt)\b)/i.test(pass.text)
+      return nameLetters >= 6 && Boolean(pass.parsed.price) && (!hasUnitCue || Boolean(pass.parsed.unitPrice))
+    }
+
+    if (!passes.some(pass => pass.parsed.name && pass.nameLength >= 8 && pass.confidence >= 55)) {
+      const focused = makeTagCrops(makeRedChannelVariant(prepared.source))
+      for (const index of [20, 21]) {
+        const titleCrop = focused[index]
+        if (titleCrop) {
+          await run(titleCrop, PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
+          await run(titleCrop, PSM.SINGLE_LINE)
+        }
         best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-        if (best.parsed.name && best.parsed.price && best.confidence >= 68) break
+      }
+      for (const index of [22, 23]) {
+        const priceCrop = focused[index]
+        if (priceCrop) {
+          await run(priceCrop, PSM.SINGLE_LINE, '0123456789,.€')
+          await run(priceCrop, PSM.SINGLE_WORD, '0123456789,.€')
+        }
+        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
       }
     }
 
-    if ((!best.parsed.name || !best.parsed.price) && best.confidence < 95) {
+    if (!hasGoodFields(best) || best.confidence < 68) {
+      onProgress({ status: 'enhancing image', progress: 0.18 })
+      const redChannel = makeRedChannelVariant(prepared.source)
+      await run(redChannel, PSM.SPARSE_TEXT)
+      const redCrops = makeTagCrops(redChannel).slice(-3)
+      if (redCrops[0]) await run(redCrops[0], PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
+      if (redCrops[1]) await run(redCrops[1], PSM.SINGLE_WORD, '0123456789,.€')
+      if (redCrops[2]) await run(redCrops[2], PSM.SINGLE_LINE, '0123456789,.€€/KGkg')
+      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+    }
+
+    if (!hasGoodFields(best) || best.confidence < 92) {
+      const crops = makeTagCrops(prepared.source)
+      for (let index = 0; index < crops.length; index++) {
+        onProgress({ status: 'cropping label', progress: 0.15 + index * 0.045 })
+        await run(crops[index], PSM.SINGLE_BLOCK)
+        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+        if (hasGoodFields(best) && best.confidence >= 68) break
+      }
+    }
+
+    if (!hasGoodFields(best) || best.confidence < 95) {
+      onProgress({ status: 'enhancing image', progress: 0.62 })
+      await run(makeGrayVariant(prepared.source), PSM.SINGLE_BLOCK)
+      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+    }
+
+    if (!hasGoodFields(best) || best.confidence < 90) {
+      onProgress({ status: 'enhancing image', progress: 0.66 })
+      await run(makeBlueChannelVariant(prepared.source), PSM.SINGLE_BLOCK)
+      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+      const focusedCrops = makeTagCrops(makeBlueChannelVariant(prepared.source)).slice(-2)
+      for (const crop of focusedCrops) {
+        await run(crop, PSM.SINGLE_BLOCK)
+        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+      }
+    }
+
+    if (!hasGoodFields(best) || best.confidence < 90) {
+      onProgress({ status: 'enhancing image', progress: 0.70 })
+      const adaptive = makeAdaptiveVariant(prepared.source)
+      await run(adaptive, PSM.SPARSE_TEXT)
+      const adaptiveCrops = makeTagCrops(adaptive).slice(-2)
+      for (const crop of adaptiveCrops) {
+        await run(crop, PSM.SPARSE_TEXT)
+        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+      }
+      const focused = makeTagCrops(prepared.source)
+      const titleCrop = focused[8]
+      const priceCrops = focused.slice(9)
+      if (titleCrop) await run(titleCrop, PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
+      for (const crop of priceCrops) {
+        await run(crop, PSM.SINGLE_LINE, '0123456789,.€')
+        await run(crop, PSM.SINGLE_WORD, '0123456789,.€')
+      }
+      for (const degrees of [4, 7, -7]) {
+        const deskewed = rotateCanvas(prepared.source, degrees)
+        for (const crop of makeTagCrops(deskewed).slice(-3)) {
+          await run(crop, PSM.SPARSE_TEXT)
+          best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+        }
+      }
+    }
+
+    if (!hasGoodFields(best) || best.confidence < 95) {
       onProgress({ status: 'enhancing image', progress: 0.35 })
       await run(prepared.enhanced, PSM.SINGLE_BLOCK)
       best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
     }
 
-    if ((!best.parsed.name || !best.parsed.price) && best.confidence < 90) {
+    if (!hasGoodFields(best) || best.confidence < 90) {
       onProgress({ status: 'reading sparse label text', progress: 0.65 })
       await run(prepared.source, PSM.SPARSE_TEXT)
       best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
     }
 
-    const pricePass = [...passes].filter(pass => pass.parsed.price).sort((a, b) => b.priceHeight - a.priceHeight || b.confidence - a.confidence)[0]
     const namePass = [...passes].filter(pass => pass.parsed.name).sort((a, b) => b.nameLength - a.nameLength || b.confidence - a.confidence)[0]
     const unitPass = [...passes].filter(pass => pass.parsed.unitLabel).sort((a, b) => {
       const aHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(a.text)
       const bHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(b.text)
       return Number(bHasDecimal) - Number(aHasDecimal) || b.confidence - a.confidence
     })[0]
+    const candidatePrice = [...passes].flatMap(pass => {
+      if (!pass.parsed.price) return []
+      const explicitDecimal = pass.text.split(/[\r\n]+/).some(line => amountsIn(line).some(amount =>
+        amount.value === pass.parsed.price && /[.,]\d{1,2}/.test(amount.raw),
+      ))
+      const geometrySupported = pass.priceHeight >= 80
+      return explicitDecimal || geometrySupported ? [{ value: pass.parsed.price, explicitDecimal, geometrySupported, confidence: pass.confidence }] : []
+    }).sort((a, b) => Number(b.geometrySupported) - Number(a.geometrySupported)
+      || Number(b.explicitDecimal) - Number(a.explicitDecimal) || b.confidence - a.confidence)[0]
     const merged: ParsedOcr = {
-      name: namePass?.parsed.name || best.parsed.name,
-      price: pricePass?.parsed.price || best.parsed.price,
+      name: namePass && namePass.nameLength >= 8 && (namePass.confidence >= 55 || passes.filter(pass => pass.parsed.name === namePass.parsed.name).length >= 2)
+        ? namePass.parsed.name : '',
+      price: candidatePrice && candidatePrice.confidence >= 50 ? candidatePrice.value : '',
       unitPrice: unitPass?.parsed.unitPrice || '',
       unitLabel: unitPass?.parsed.unitLabel || '',
     }
+    Object.assign(merged, sanitizeMergedFields(merged, passes))
+    const hasPrintedUnitDecimals = passes.some(pass => pass.parsed.unitLabel
+      && new RegExp(`\\d+[.,]\\d{1,2}\\s*(?:€\\s*)?\\/?\\s*(?:${pass.parsed.unitLabel === 'kg' ? 'kg' : 'l|lt'})\\b`, 'i').test(pass.text))
+    const hasExplicitUnitCue = passes.some(pass => /(?:€\s*\/\s*(?:kg|l|lt)\b|\/\s*(?:kg|l|lt)\b|\bper\s*(?:kg|l|lt)\b|\bpor\s*(?:kg|l|lt)\b)/i.test(pass.text))
+    const isLooseProducePrice = passes.some(pass => /(?:^|\n)\s*(?:€\s*)?\/\s*kg\b/i.test(pass.text))
+    if (merged.price && merged.unitLabel && hasExplicitUnitCue && !hasPrintedUnitDecimals && isLooseProducePrice) merged.unitPrice = merged.price
     const nameOccurrences = new Map<string, number>()
     for (const pass of passes) {
       for (const token of new Set(pass.parsed.name.toLocaleUpperCase().split(/\s+/).filter(Boolean))) {

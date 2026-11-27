@@ -135,6 +135,21 @@ describe('parseOcr', () => {
     expect(parseOcr('2 59€\n5,18 £/LT', layout)).toMatchObject({ price: '2.59', unitPrice: '5.18', unitLabel: 'L' })
   })
 
+  it('reconstructs the price when the large leading digit and cents are on separate OCR rows', () => {
+    const layout = [
+      { text: 'CLEMENTINA', bbox: { x0: 100, y0: 20, x1: 500, y1: 80 } },
+      { text: '2', bbox: { x0: 100, y0: 100, x1: 450, y1: 520 }, words: [{ text: '2', bbox: { x0: 100, y0: 100, x1: 450, y1: 520 } }] },
+      { text: '49', bbox: { x0: 600, y0: 125, x1: 1050, y1: 390 }, words: [{ text: '49', bbox: { x0: 600, y0: 125, x1: 1050, y1: 390 } }] },
+    ]
+
+    expect(parseOcr('CLEMENTINA\n€/KG\n2\n49', layout)).toMatchObject({
+      name: 'CLEMENTINA',
+      price: '2.49',
+      unitPrice: '2.49',
+      unitLabel: 'kg',
+    })
+  })
+
   it('uses the largest printed amount as shelf price when smaller reference prices are present', () => {
     const layout = [
       { text: '5,19 € PVPR', bbox: { x0: 0, y0: 50, x1: 120, y1: 68 } },
@@ -204,18 +219,36 @@ describe('parseOcr', () => {
 
   it('reads a loose-price produce tag with the unit on its own line', () => {
     expect(parseOcr('CLEMENTINA\nCONTINENTE\n€/KG\n2,49')).toEqual({
-      name: 'CLEMENTINA',
+      name: 'CLEMENTINA CONTINENTE',
       price: '2.49',
       unitPrice: '2.49',
       unitLabel: 'kg',
     })
   })
 
-  it('does not use a PVPR reference price instead of the large current price', () => {
-    expect(parseOcr('COENTROS\nCONTINENTE BIO 30G\n0,99€\n23,00 €/KG')).toEqual({
-      name: 'COENTROS',
+  it('reads a yellow Continente BIO shelf tag with adjacent package and unit-price lines', () => {
+    expect(parseOcr('COENTROS\nCONTINENTE BIO 30G\n0,99€\n23,00\n€/KG')).toEqual({
+      name: 'COENTROS CONTINENTE BIO 30G',
       price: '0.99',
       unitPrice: '23.00',
+      unitLabel: 'kg',
+    })
+  })
+
+  it('parses the complete expected name and prices for the second supplied photo', () => {
+    expect(parseOcr('COENTROS\nCONTINENTE BIO 30G\n0,99 €\n33,00 €/KG')).toEqual({
+      name: 'COENTROS CONTINENTE BIO 30G',
+      price: '0.99',
+      unitPrice: '33.00',
+      unitLabel: 'kg',
+    })
+  })
+
+  it('keeps a shelf price but leaves the unit price blank when OCR did not read it', () => {
+    expect(parseOcr('COENTROS\nCONTINENTE BIO 30G\n0,99€\nKG')).toEqual({
+      name: 'COENTROS CONTINENTE BIO 30G',
+      price: '0.99',
+      unitPrice: '',
       unitLabel: 'kg',
     })
   })
