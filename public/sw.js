@@ -1,4 +1,4 @@
-const CACHE_NAME = 'basket-shell-v3'
+const CACHE_NAME = 'basket-shell-v4'
 const APP_ROOT = new URL('./', self.registration.scope)
 const APP_SHELL = [APP_ROOT.href, new URL('manifest.webmanifest', APP_ROOT).href, new URL('basket-icon.svg', APP_ROOT).href]
 
@@ -14,8 +14,23 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET' || new URL(event.request.url).origin !== self.location.origin) return
+  if (event.request.mode === 'navigate') {
+    event.respondWith(fetch(event.request).then(response => {
+      if (response.ok) {
+        const copy = response.clone()
+        event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)))
+      }
+      return response
+    }).catch(async () => {
+      const cached = await caches.match(event.request)
+      if (cached) return cached
+      return caches.match(APP_ROOT.href)
+    }))
+    return
+  }
+
   event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request).then(response => {
-    if (response.ok) caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()))
+    if (response.ok) event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone())))
     return response
   })))
 })
