@@ -8,6 +8,43 @@ type OcrPass = { parsed: ParsedOcr; text: string; confidence: number; priceHeigh
 type OcrLayoutWord = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence?: number }
 type OcrLayoutLine = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; words?: OcrLayoutWord[] }
 
+const MAX_OCR_PASSES = 2
+const OCR_PASS_TIMEOUT_MS = 10_000
+const OCR_WORKER_TIMEOUT_MS = 18_000
+type OcrWorker = Awaited<ReturnType<typeof createWorker>>
+let sharedWorkerPromise: Promise<OcrWorker> | undefined
+let activeProgress: (progress: { status: string; progress: number }) => void = () => {}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timer!))
+}
+
+async function getOcrWorker(onProgress: (progress: { status: string; progress: number }) => void): Promise<OcrWorker> {
+  activeProgress = onProgress
+  if (!sharedWorkerPromise) {
+    const pending = createWorker(['por'], undefined, { logger: message => activeProgress(message) })
+    sharedWorkerPromise = pending
+    void pending.catch(() => {
+      if (sharedWorkerPromise === pending) sharedWorkerPromise = undefined
+    })
+  }
+
+  const pending = sharedWorkerPromise
+  try {
+    return await withTimeout(pending, OCR_WORKER_TIMEOUT_MS, 'O motor de leitura demorou demasiado a iniciar.')
+  } catch (error) {
+    if (sharedWorkerPromise === pending) sharedWorkerPromise = undefined
+    void pending.then(worker => worker.terminate()).catch(() => {})
+    throw error
+  }
+}
+
 const PRICE_TOKEN = /(?<![\d.,])(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?![\d.,])/g
 const UNIT_CUE = /(?:\/\s?(?:kg|l|lt)\b|\bpor\s?(?:kg|l|lt)\b|\bper\s?(?:kg|l|lt)\b|€\s?\/\s?(?:kg|l|lt)\b|\b(?:kg|l|lt)\s?\/)/i
 const WEIGHT_TOKEN = /\b\d+(?:[.,]\d+)?\s?(?:kg|g|mg|ml|cl|dl|l)\b/i
@@ -314,61 +351,6 @@ export function parseOcr(text: string, layoutLines: OcrLayoutLine[] = []): Parse
   return { name, price: completePrice, unitPrice: adjustedUnitPrice, unitLabel }
 }
 
-function otsuThreshold(histogram: Uint32Array, pixelCount: number): number {
-  let total = 0
-  for (let i = 0; i < histogram.length; i++) total += i * histogram[i]
-  let backgroundWeight = 0
-  let backgroundSum = 0
-  let bestVariance = -1
-  let threshold = 150
-  for (let i = 0; i < histogram.length; i++) {
-    backgroundWeight += histogram[i]
-    if (!backgroundWeight) continue
-    const foregroundWeight = pixelCount - backgroundWeight
-    if (!foregroundWeight) break
-    backgroundSum += i * histogram[i]
-    const meansDifference = backgroundSum / backgroundWeight - (total - backgroundSum) / foregroundWeight
-    const variance = backgroundWeight * foregroundWeight * meansDifference * meansDifference
-    if (variance > bestVariance) {
-      bestVariance = variance
-      threshold = i
-    }
-  }
-  return Math.max(80, Math.min(205, threshold))
-}
-
-function makeOcrVariant(source: HTMLCanvasElement): HTMLCanvasElement {
-  const context = source.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  const image = context.getImageData(0, 0, source.width, source.height)
-  const histogram = new Uint32Array(256)
-  const luminance = new Uint8Array(image.data.length / 4)
-
-  for (let i = 0, pixel = 0; i < image.data.length; i += 4, pixel++) {
-    const gray = Math.max(0, Math.min(255, Math.round(0.299 * image.data[i] + 0.587 * image.data[i + 1] + 0.114 * image.data[i + 2])))
-    const enhanced = Math.max(0, Math.min(255, Math.round((gray - 128) * 1.45 + 128)))
-    luminance[pixel] = enhanced
-    histogram[enhanced]++
-  }
-
-  const threshold = otsuThreshold(histogram, luminance.length)
-  for (let pixel = 0, i = 0; pixel < luminance.length; pixel++, i += 4) {
-    const value = luminance[pixel] > threshold ? 255 : 0
-    image.data[i] = value
-    image.data[i + 1] = value
-    image.data[i + 2] = value
-    image.data[i + 3] = 255
-  }
-
-  const variant = document.createElement('canvas')
-  variant.width = source.width
-  variant.height = source.height
-  const variantContext = variant.getContext('2d')
-  if (!variantContext) throw new Error('Canvas 2D context is unavailable')
-  variantContext.putImageData(image, 0, 0)
-  return variant
-}
-
 async function loadImage(file: File): Promise<{ image: CanvasImageSource; width: number; height: number; dispose: () => void }> {
   if ('createImageBitmap' in window) {
     const bitmap = await createImageBitmap(file)
@@ -390,11 +372,11 @@ async function loadImage(file: File): Promise<{ image: CanvasImageSource; width:
   }
 }
 
-async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCanvasElement; enhanced: HTMLCanvasElement }> {
+async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCanvasElement }> {
   const decoded = await loadImage(file)
   try {
     const pixels = decoded.width * decoded.height
-    const scale = Math.min(1.5, 2400 / Math.max(decoded.width, decoded.height), Math.sqrt(5_000_000 / pixels))
+    const scale = Math.min(1.25, 2000 / Math.max(decoded.width, decoded.height), Math.sqrt(2_500_000 / pixels))
     const source = document.createElement('canvas')
     source.width = Math.max(1, Math.round(decoded.width * scale))
     source.height = Math.max(1, Math.round(decoded.height * scale))
@@ -412,210 +394,21 @@ async function prepareImage(file: File): Promise<{ photo: string; source: HTMLCa
     if (!photoContext) throw new Error('Canvas 2D context is unavailable')
     photoContext.drawImage(source, 0, 0, photoCanvas.width, photoCanvas.height)
 
-    return { photo: photoCanvas.toDataURL('image/jpeg', 0.88), source, enhanced: makeOcrVariant(source) }
+    return { photo: photoCanvas.toDataURL('image/jpeg', 0.88), source }
   } finally {
     decoded.dispose()
   }
 }
 
-function makeTagCrops(source: HTMLCanvasElement): HTMLCanvasElement[] {
-  const regions = [
-    { x: 0.10, y: 0.18, width: 0.82, height: 0.68 },
-    { x: 0.12, y: 0.22, width: 0.78, height: 0.60 },
-    { x: 0.06, y: 0.08, width: 0.88, height: 0.84 },
-    { x: 0.02, y: 0.14, width: 0.96, height: 0.70 },
-    { x: 0.02, y: 0.30, width: 0.96, height: 0.62 },
-    { x: 0.02, y: 0.40, width: 0.96, height: 0.52 },
-    { x: 0.02, y: 0.22, width: 0.96, height: 0.76 },
-    { x: 0.00, y: 0.34, width: 1.00, height: 0.48 },
-    { x: 0.03, y: 0.20, width: 0.94, height: 0.34 },
-    { x: 0.03, y: 0.42, width: 0.94, height: 0.48 },
-    { x: 0.04, y: 0.27, width: 0.78, height: 0.19 },
-    { x: 0.05, y: 0.40, width: 0.72, height: 0.30 },
-    { x: 0.34, y: 0.58, width: 0.62, height: 0.25 },
-    { x: 0.00, y: 0.35, width: 1.00, height: 0.65 },
-    { x: 0.12, y: 0.38, width: 0.82, height: 0.58 },
-    { x: 0.32, y: 0.48, width: 0.68, height: 0.45 },
-    { x: 0.48, y: 0.48, width: 0.52, height: 0.45 },
-    { x: 0.08, y: 0.28, width: 0.55, height: 0.14 },
-    { x: 0.08, y: 0.40, width: 0.50, height: 0.30 },
-    { x: 0.43, y: 0.57, width: 0.50, height: 0.16 },
-    { x: 0.07, y: 0.17, width: 0.72, height: 0.18 },
-    { x: 0.07, y: 0.24, width: 0.78, height: 0.18 },
-    { x: 0.08, y: 0.40, width: 0.66, height: 0.40 },
-    { x: 0.52, y: 0.79, width: 0.46, height: 0.17 },
-  ]
-
-  return regions.map(region => {
-    const crop = document.createElement('canvas')
-    const sourceX = Math.round(source.width * region.x)
-    const sourceY = Math.round(source.height * region.y)
-    const sourceWidth = Math.round(source.width * region.width)
-    const sourceHeight = Math.round(source.height * region.height)
-    const scale = Math.min(1.7, 2800 / Math.max(sourceWidth, sourceHeight))
-    crop.width = Math.max(1, Math.round(sourceWidth * scale))
-    crop.height = Math.max(1, Math.round(sourceHeight * scale))
-    const context = crop.getContext('2d', { willReadFrequently: true })
-    if (!context) throw new Error('Canvas 2D context is unavailable')
-    context.imageSmoothingEnabled = true
-    context.imageSmoothingQuality = 'high'
-    context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height)
-    return crop
-  })
-}
-
-function makeGrayVariant(source: HTMLCanvasElement): HTMLCanvasElement {
-  const variant = document.createElement('canvas')
-  variant.width = source.width
-  variant.height = source.height
-  const context = variant.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.drawImage(source, 0, 0)
-  const image = context.getImageData(0, 0, source.width, source.height)
-  for (let i = 0; i < image.data.length; i += 4) {
-    const gray = Math.max(0, Math.min(255, Math.round(0.299 * image.data[i] + 0.587 * image.data[i + 1] + 0.114 * image.data[i + 2])))
-    const enhanced = Math.max(0, Math.min(255, Math.round((gray - 128) * 1.6 + 128)))
-    image.data[i] = enhanced
-    image.data[i + 1] = enhanced
-    image.data[i + 2] = enhanced
-  }
-  context.putImageData(image, 0, 0)
-  return variant
-}
-
-function makeBlueChannelVariant(source: HTMLCanvasElement): HTMLCanvasElement {
-  const variant = document.createElement('canvas')
-  variant.width = source.width
-  variant.height = source.height
-  const context = variant.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.drawImage(source, 0, 0)
-  const image = context.getImageData(0, 0, source.width, source.height)
-  for (let i = 0; i < image.data.length; i += 4) {
-    const enhanced = Math.max(0, Math.min(255, Math.round((image.data[i + 2] - 112) * 1.8 + 128)))
-    image.data[i] = enhanced
-    image.data[i + 1] = enhanced
-    image.data[i + 2] = enhanced
-  }
-  context.putImageData(image, 0, 0)
-  return variant
-}
-
-function makeRedChannelVariant(source: HTMLCanvasElement): HTMLCanvasElement {
-  const variant = document.createElement('canvas')
-  variant.width = source.width
-  variant.height = source.height
-  const context = variant.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.drawImage(source, 0, 0)
-  const image = context.getImageData(0, 0, source.width, source.height)
-  for (let i = 0; i < image.data.length; i += 4) {
-    const enhanced = Math.max(0, Math.min(255, Math.round((image.data[i] - 130) * 1.65 + 128)))
-    image.data[i] = enhanced
-    image.data[i + 1] = enhanced
-    image.data[i + 2] = enhanced
-  }
-  context.putImageData(image, 0, 0)
-  return variant
-}
-
-function makeAdaptiveVariant(source: HTMLCanvasElement): HTMLCanvasElement {
-  const variant = document.createElement('canvas')
-  variant.width = source.width
-  variant.height = source.height
-  const context = variant.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.drawImage(source, 0, 0)
-  const image = context.getImageData(0, 0, source.width, source.height)
-  const width = source.width
-  const height = source.height
-  const gray = new Uint8Array(width * height)
-  const integral = new Float64Array((width + 1) * (height + 1))
-
-  for (let y = 0; y < height; y++) {
-    let rowSum = 0
-    for (let x = 0; x < width; x++) {
-      const offset = (y * width + x) * 4
-      const value = Math.round(0.299 * image.data[offset] + 0.587 * image.data[offset + 1] + 0.114 * image.data[offset + 2])
-      gray[y * width + x] = value
-      rowSum += value
-      integral[(y + 1) * (width + 1) + x + 1] = integral[y * (width + 1) + x + 1] + rowSum
-    }
-  }
-
-  const radius = Math.max(12, Math.round(Math.min(width, height) * 0.012))
-  for (let y = 0; y < height; y++) {
-    const top = Math.max(0, y - radius)
-    const bottom = Math.min(height - 1, y + radius)
-    for (let x = 0; x < width; x++) {
-      const left = Math.max(0, x - radius)
-      const right = Math.min(width - 1, x + radius)
-      const area = (right - left + 1) * (bottom - top + 1)
-      const sum = integral[(bottom + 1) * (width + 1) + right + 1] - integral[top * (width + 1) + right + 1]
-        - integral[(bottom + 1) * (width + 1) + left] + integral[top * (width + 1) + left]
-      const threshold = sum / area - 10
-      const value = gray[y * width + x] < threshold ? 0 : 255
-      const offset = (y * width + x) * 4
-      image.data[offset] = value
-      image.data[offset + 1] = value
-      image.data[offset + 2] = value
-      image.data[offset + 3] = 255
-    }
-  }
-  context.putImageData(image, 0, 0)
-  return variant
-}
-
-function rotateCanvas(source: HTMLCanvasElement, degrees: number): HTMLCanvasElement {
-  const radians = degrees * Math.PI / 180
-  const width = Math.ceil(Math.abs(source.width * Math.cos(radians)) + Math.abs(source.height * Math.sin(radians)))
-  const height = Math.ceil(Math.abs(source.height * Math.cos(radians)) + Math.abs(source.width * Math.sin(radians)))
-  const rotated = document.createElement('canvas')
-  rotated.width = width
-  rotated.height = height
-  const context = rotated.getContext('2d')
-  if (!context) throw new Error('Canvas 2D context is unavailable')
-  context.translate(width / 2, height / 2)
-  context.rotate(radians)
-  context.drawImage(source, -source.width / 2, -source.height / 2)
-  return rotated
-}
-
-function makeTagCrop(source: HTMLCanvasElement, layoutLines: OcrLayoutLine[]): HTMLCanvasElement | undefined {
-  const unitLine = layoutLines.find(line => UNIT_CUE.test(line.text))
-  const unitWord = unitLine?.words?.find(word => UNIT_CUE.test(word.text))
-  const titleLine = layoutLines
-    .filter(line => {
-      const words = productWordsInLine(line)
-      const averageConfidence = words.reduce((sum, word) => sum + (word.confidence ?? 0), 0) / Math.max(1, words.length)
-      const letters = words.map(word => word.text).join('').replace(/[^\p{L}]/gu, '').length
-      return words.length >= 2 && letters >= 8 && averageConfidence >= 50 && line.bbox.y0 < (unitLine?.bbox.y0 ?? source.height)
-    })
-    .sort((a, b) => a.bbox.y0 - b.bbox.y0)[0]
-  if (!unitLine || !titleLine) return undefined
-
-  const titleWords = productWordsInLine(titleLine)
-  const titleLeft = Math.min(...titleWords.map(word => word.bbox.x0))
-  const titleRight = Math.max(...titleWords.map(word => word.bbox.x1))
-  const unitBounds = unitWord?.bbox ?? unitLine.bbox
-  const marginX = Math.round(source.width * 0.035)
-  const marginY = Math.round(source.height * 0.025)
-  const sourceX = Math.max(0, Math.min(titleLeft, unitBounds.x0) - marginX)
-  const sourceY = Math.max(0, titleLine.bbox.y0 - marginY)
-  const sourceRight = Math.min(source.width, Math.max(titleRight, unitBounds.x1) + marginX)
-  const sourceBottom = Math.min(source.height, unitBounds.y1 + marginY)
-  const sourceWidth = sourceRight - sourceX
-  const sourceHeight = sourceBottom - sourceY
-  if (sourceWidth < 20 || sourceHeight < 20) return undefined
-  const scale = Math.min(1.4, 2400 / Math.max(sourceWidth, sourceHeight))
+function makeLabelCrop(source: HTMLCanvasElement): HTMLCanvasElement {
   const crop = document.createElement('canvas')
-  crop.width = Math.max(1, Math.round(sourceWidth * scale))
-  crop.height = Math.max(1, Math.round(sourceHeight * scale))
-  const context = crop.getContext('2d', { willReadFrequently: true })
+  crop.width = Math.round(source.width * 0.94)
+  crop.height = Math.round(source.height * 0.80)
+  const context = crop.getContext('2d')
   if (!context) throw new Error('Canvas 2D context is unavailable')
   context.imageSmoothingEnabled = true
   context.imageSmoothingQuality = 'high'
-  context.drawImage(source, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height)
+  context.drawImage(source, Math.round(source.width * 0.03), Math.round(source.height * 0.08), crop.width, crop.height, 0, 0, crop.width, crop.height)
   return crop
 }
 
@@ -629,11 +422,10 @@ function sanitizeMergedFields(parsed: ParsedOcr, passes: OcrPass[]): ParsedOcr {
   const packageSize = passes.find(pass => packageSizeFrom(pass.parsed.name, pass.layoutLines))
   const photoSuggestsFreshProduce = passes.some(pass => /(?:\bKG\b|€\s*\/\s*KG)/i.test(pass.text))
     && !passes.some(pass => WEIGHT_TOKEN.test(pass.parsed.name) && !/\b(?:BIO|GM|G)\b/i.test(pass.parsed.name))
-  const nameHasEvidence = passes.some(pass => pass.parsed.name === result.name && pass.confidence >= 55)
+  const nameHasEvidence = passes.some(pass => pass.parsed.name === result.name)
   if (!nameHasEvidence) result.name = ''
 
-  const explicitPricePass = passes.find(pass => pass.parsed.price === result.price
-    && pass.text.split(/[\r\n]+/).some(line => amountsIn(line).some(amount => amount.value === result.price && /[.,]\d{1,2}/.test(amount.raw))))
+  const explicitPricePass = passes.find(pass => pass.parsed.price === result.price)
   const geometryPricePass = passes.find(pass => pass.parsed.price === result.price && pass.priceHeight >= 80)
   if (!explicitPricePass && !geometryPricePass) result.price = ''
   const packagePriceEvidence = passes.some(pass => pass.parsed.price && pass.priceHeight >= 80)
@@ -641,11 +433,15 @@ function sanitizeMergedFields(parsed: ParsedOcr, passes: OcrPass[]): ParsedOcr {
   if (result.price && !packagePriceEvidence && !packageSize && Number(result.price) > (storeLabel ? 5 : 50)) result.price = ''
   if (result.price && photoSuggestsFreshProduce && Number(result.price) > 10) result.price = ''
 
-  if (result.unitPrice && !passes.some(pass => pass.parsed.unitPrice === result.unitPrice && pass.confidence >= 50)) {
+  if (result.unitPrice && !passes.some(pass => pass.parsed.unitPrice === result.unitPrice)) {
     result.unitPrice = ''
   }
-  if (!result.price) result.unitPrice = ''
   return result
+}
+
+export function shouldRetryOcr(passes: readonly (ParsedOcr & { confidence?: number })[]): boolean {
+  const complete = passes.some(pass => pass.name.trim().length >= 3 && Boolean(pass.price) && (pass.confidence ?? 0) >= 55)
+  return !complete && passes.length < MAX_OCR_PASSES
 }
 
 export async function recognizePriceTag(file: File, onProgress: (progress: OcrProgress) => void = () => {}): Promise<PriceTagResult> {
@@ -654,204 +450,104 @@ export async function recognizePriceTag(file: File, onProgress: (progress: OcrPr
 
   const prepared = await prepareImage(file)
   onProgress({ status: 'photo prepared', progress: 0, photo: prepared.photo })
-  let worker: Awaited<ReturnType<typeof createWorker>> | undefined
+  const passes: OcrPass[] = []
+  let worker: OcrWorker | undefined
+
+  const run = async (image: HTMLCanvasElement, psm: typeof PSM.SPARSE_TEXT | typeof PSM.SINGLE_BLOCK) => {
+    if (!worker || passes.length >= MAX_OCR_PASSES) return
+    const attempt = passes.length + 1
+    onProgress({ status: `recognizing text (${attempt}/${MAX_OCR_PASSES})`, progress: 0.1 + (attempt - 1) * 0.3 })
+    const result = await withTimeout((async () => {
+      await worker!.setParameters({
+        tessedit_pageseg_mode: psm,
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '300',
+        tessedit_char_whitelist: '',
+      })
+      return worker!.recognize(image, {}, { blocks: true })
+    })(), OCR_PASS_TIMEOUT_MS, 'A leitura demorou demasiado; preencha os campos reconhecidos manualmente.')
+    const text = result.data.text.trim()
+    const layoutLines = result.data.blocks?.flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines)) ?? []
+    const parsed = parseOcr(text, layoutLines)
+    const priceHeight = Math.max(0, ...amountFromLayoutWords(layoutLines).filter(candidate => candidate.value === parsed.price).map(candidate => candidate.height))
+    const nameLength = [...parsed.name].filter(character => /\p{L}/u.test(character)).length + (WEIGHT_TOKEN.test(parsed.name) ? 20 : 0)
+    const packageSize = packageSizeFrom(parsed.name, layoutLines)?.[0] ?? ''
+    passes.push({ parsed, text, confidence: result.data.confidence ?? 0, priceHeight, nameLength, packageSize, layoutLines })
+  }
+
+  const bestPass = () => passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
+  const shouldContinue = () => shouldRetryOcr(passes.map(pass => ({ ...pass.parsed, confidence: pass.confidence })))
+
   try {
-    worker = await createWorker(['por', 'eng'], undefined, {
-      logger: message => onProgress({ status: message.status, progress: message.progress }),
-    })
-    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK, preserve_interword_spaces: '1', user_defined_dpi: '300' })
+    worker = await getOcrWorker(message => onProgress({ status: message.status, progress: message.progress, photo: prepared.photo }))
+    await run(makeLabelCrop(prepared.source), PSM.SPARSE_TEXT)
 
-    const passes: OcrPass[] = []
-    const run = async (
-      image: HTMLCanvasElement,
-      psm: typeof PSM.SINGLE_BLOCK | typeof PSM.SPARSE_TEXT | typeof PSM.SINGLE_LINE | typeof PSM.SINGLE_WORD,
-      whitelist = '',
-    ) => {
-      await worker!.setParameters({ tessedit_pageseg_mode: psm })
-      if (whitelist) await worker!.setParameters({ tessedit_char_whitelist: whitelist })
-      else await worker!.setParameters({ tessedit_char_whitelist: '' })
-      const result = await worker!.recognize(image, { rotateAuto: true }, { blocks: true })
-      const text = result.data.text.trim()
-      const layoutLines = result.data.blocks?.flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines)) ?? []
-      const parsed = parseOcr(text, layoutLines)
-      const priceHeight = Math.max(0, ...amountFromLayoutWords(layoutLines).filter(candidate => candidate.value === parsed.price).map(candidate => candidate.height))
-      const nameLength = [...parsed.name].filter(character => /\p{L}/u.test(character)).length + (WEIGHT_TOKEN.test(parsed.name) ? 20 : 0)
-      const packageSize = packageSizeFrom(parsed.name, layoutLines)?.[0] ?? ''
-      passes.push({ parsed, text, confidence: result.data.confidence ?? 0, priceHeight, nameLength, packageSize, layoutLines })
-    }
-
-    onProgress({ status: 'recognizing text', progress: 0.05 })
-    await run(prepared.source, PSM.SINGLE_BLOCK)
-    await run(prepared.source, PSM.SPARSE_TEXT)
-    const cropPass = [...passes]
-      .filter(pass => pass.parsed.name && pass.parsed.unitLabel)
-      .sort((a, b) => passScore(b) - passScore(a))[0]
-    const detectedTag = cropPass ? makeTagCrop(prepared.source, cropPass.layoutLines) : undefined
-    if (detectedTag) {
-      onProgress({ status: 'cropping label', progress: 0.15 })
-      await run(detectedTag, PSM.SINGLE_BLOCK)
-      await run(detectedTag, PSM.SPARSE_TEXT)
-    }
-    let best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-
-    const hasGoodFields = (pass: OcrPass) => {
-      const nameLetters = [...pass.parsed.name].filter(character => /\p{L}/u.test(character)).length
-      const hasUnitCue = Boolean(pass.parsed.unitLabel) || /(?:\/\s?kg|€\s?\/\s?kg|\bkg\b|\/\s?(?:l|lt)\b)/i.test(pass.text)
-      return nameLetters >= 6 && Boolean(pass.parsed.price) && (!hasUnitCue || Boolean(pass.parsed.unitPrice))
-    }
-
-    if (!passes.some(pass => pass.parsed.name && pass.nameLength >= 8 && pass.confidence >= 55)) {
-      const focused = makeTagCrops(makeRedChannelVariant(prepared.source))
-      for (const index of [20, 21]) {
-        const titleCrop = focused[index]
-        if (titleCrop) {
-          await run(titleCrop, PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
-          await run(titleCrop, PSM.SINGLE_LINE)
-        }
-        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-      }
-      for (const index of [22, 23]) {
-        const priceCrop = focused[index]
-        if (priceCrop) {
-          await run(priceCrop, PSM.SINGLE_LINE, '0123456789,.€')
-          await run(priceCrop, PSM.SINGLE_WORD, '0123456789,.€')
-        }
-        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-      }
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 68) {
-      onProgress({ status: 'enhancing image', progress: 0.18 })
-      const redChannel = makeRedChannelVariant(prepared.source)
-      await run(redChannel, PSM.SPARSE_TEXT)
-      const redCrops = makeTagCrops(redChannel).slice(-3)
-      if (redCrops[0]) await run(redCrops[0], PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
-      if (redCrops[1]) await run(redCrops[1], PSM.SINGLE_WORD, '0123456789,.€')
-      if (redCrops[2]) await run(redCrops[2], PSM.SINGLE_LINE, '0123456789,.€€/KGkg')
-      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 92) {
-      const crops = makeTagCrops(prepared.source)
-      for (let index = 0; index < crops.length; index++) {
-        onProgress({ status: 'cropping label', progress: 0.15 + index * 0.045 })
-        await run(crops[index], PSM.SINGLE_BLOCK)
-        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-        if (hasGoodFields(best) && best.confidence >= 68) break
-      }
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 95) {
-      onProgress({ status: 'enhancing image', progress: 0.62 })
-      await run(makeGrayVariant(prepared.source), PSM.SINGLE_BLOCK)
-      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 90) {
-      onProgress({ status: 'enhancing image', progress: 0.66 })
-      await run(makeBlueChannelVariant(prepared.source), PSM.SINGLE_BLOCK)
-      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-      const focusedCrops = makeTagCrops(makeBlueChannelVariant(prepared.source)).slice(-2)
-      for (const crop of focusedCrops) {
-        await run(crop, PSM.SINGLE_BLOCK)
-        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-      }
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 90) {
-      onProgress({ status: 'enhancing image', progress: 0.70 })
-      const adaptive = makeAdaptiveVariant(prepared.source)
-      await run(adaptive, PSM.SPARSE_TEXT)
-      const adaptiveCrops = makeTagCrops(adaptive).slice(-2)
-      for (const crop of adaptiveCrops) {
-        await run(crop, PSM.SPARSE_TEXT)
-        best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-      }
-      const focused = makeTagCrops(prepared.source)
-      const titleCrop = focused[8]
-      const priceCrops = focused.slice(9)
-      if (titleCrop) await run(titleCrop, PSM.SINGLE_LINE, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÀÂÃÇÊÔÕÜáéíóúàâãçêôõü0123456789-')
-      for (const crop of priceCrops) {
-        await run(crop, PSM.SINGLE_LINE, '0123456789,.€')
-        await run(crop, PSM.SINGLE_WORD, '0123456789,.€')
-      }
-      for (const degrees of [4, 7, -7]) {
-        const deskewed = rotateCanvas(prepared.source, degrees)
-        for (const crop of makeTagCrops(deskewed).slice(-3)) {
-          await run(crop, PSM.SPARSE_TEXT)
-          best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-        }
-      }
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 95) {
-      onProgress({ status: 'enhancing image', progress: 0.35 })
-      await run(prepared.enhanced, PSM.SINGLE_BLOCK)
-      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
-    }
-
-    if (!hasGoodFields(best) || best.confidence < 90) {
-      onProgress({ status: 'reading sparse label text', progress: 0.65 })
+    if (shouldContinue()) {
       await run(prepared.source, PSM.SPARSE_TEXT)
-      best = passes.reduce((current, pass) => passScore(pass) > passScore(current) ? pass : current)
     }
+  } catch (error) {
+    console.warn('OCR stopped; returning partial results:', error)
+    if (worker) {
+      if (sharedWorkerPromise) sharedWorkerPromise = undefined
+      void worker.terminate().catch(() => {})
+    }
+  }
 
-    const namePass = [...passes].filter(pass => pass.parsed.name).sort((a, b) => b.nameLength - a.nameLength || b.confidence - a.confidence)[0]
-    const unitPass = [...passes].filter(pass => pass.parsed.unitLabel).sort((a, b) => {
-      const aHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(a.text)
-      const bHasDecimal = /\d+[.,]\d{2}\s*(?:€\s*)?\/?\s*(?:kg|l|lt)\b/i.test(b.text)
-      return Number(bHasDecimal) - Number(aHasDecimal) || b.confidence - a.confidence
-    })[0]
-    const candidatePrice = [...passes].flatMap(pass => {
-      if (!pass.parsed.price) return []
-      const explicitDecimal = pass.text.split(/[\r\n]+/).some(line => amountsIn(line).some(amount =>
-        amount.value === pass.parsed.price && /[.,]\d{1,2}/.test(amount.raw),
-      ))
-      const geometrySupported = pass.priceHeight >= 80
-      return explicitDecimal || geometrySupported ? [{ value: pass.parsed.price, explicitDecimal, geometrySupported, confidence: pass.confidence }] : []
-    }).sort((a, b) => Number(b.geometrySupported) - Number(a.geometrySupported)
-      || Number(b.explicitDecimal) - Number(a.explicitDecimal) || b.confidence - a.confidence)[0]
-    const merged: ParsedOcr = {
-      name: namePass && namePass.nameLength >= 8 && (namePass.confidence >= 55 || passes.filter(pass => pass.parsed.name === namePass.parsed.name).length >= 2)
-        ? namePass.parsed.name : '',
-      price: candidatePrice && candidatePrice.confidence >= 50 ? candidatePrice.value : '',
-      unitPrice: unitPass?.parsed.unitPrice || '',
-      unitLabel: unitPass?.parsed.unitLabel || '',
-    }
-    Object.assign(merged, sanitizeMergedFields(merged, passes))
-    const hasPrintedUnitDecimals = passes.some(pass => pass.parsed.unitLabel
-      && new RegExp(`\\d+[.,]\\d{1,2}\\s*(?:€\\s*)?\\/?\\s*(?:${pass.parsed.unitLabel === 'kg' ? 'kg' : 'l|lt'})\\b`, 'i').test(pass.text))
-    const hasExplicitUnitCue = passes.some(pass => /(?:€\s*\/\s*(?:kg|l|lt)\b|\/\s*(?:kg|l|lt)\b|\bper\s*(?:kg|l|lt)\b|\bpor\s*(?:kg|l|lt)\b)/i.test(pass.text))
-    const isLooseProducePrice = passes.some(pass => /(?:^|\n)\s*(?:€\s*)?\/\s*kg\b/i.test(pass.text))
-    if (merged.price && merged.unitLabel && hasExplicitUnitCue && !hasPrintedUnitDecimals && isLooseProducePrice) merged.unitPrice = merged.price
-    const nameOccurrences = new Map<string, number>()
-    for (const pass of passes) {
-      for (const token of new Set(pass.parsed.name.toLocaleUpperCase().split(/\s+/).filter(Boolean))) {
-        nameOccurrences.set(token, (nameOccurrences.get(token) ?? 0) + 1)
-      }
-    }
-    if (passes.filter(pass => pass.parsed.name).length > 1 && merged.name) {
-      merged.name = merged.name.split(/\s+/).filter(token => (nameOccurrences.get(token.toLocaleUpperCase()) ?? 0) >= 2).join(' ')
-        || namePass?.parsed.name
-        || best.parsed.name
-    }
-    const packageLayout = passes.find(pass => pass.packageSize)?.layoutLines ?? []
-    const inferredPrice = shelfPriceFromUnit(merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
-    const relativePriceDifference = Math.abs(Number(merged.price) - Number(inferredPrice)) / Math.max(Number(merged.price), Number(inferredPrice))
-    const isWholeNumberPartial = Boolean(merged.price) && Number(merged.price) >= 10 && Number.isInteger(Number(merged.price))
-    if (inferredPrice && (!merged.price || isWholeNumberPartial || relativePriceDifference <= 0.25)) {
-      merged.price = inferredPrice
-    }
-    merged.unitPrice = correctUnitPrice(merged.price, merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
-    return { ...merged, photo: prepared.photo, recognizedText: best.text, confidence: best.confidence }
-  } finally {
-    await worker?.terminate()
+  if (!passes.length) {
+    return { name: '', price: '', unitPrice: '', unitLabel: '', photo: prepared.photo, recognizedText: '', confidence: 0 }
+  }
+
+  const best = bestPass()
+  const namePass = [...passes].filter(pass => pass.parsed.name)
+    .sort((a, b) => b.nameLength - a.nameLength || b.confidence - a.confidence)[0]
+  const unitPricePass = [...passes].filter(pass => pass.parsed.unitPrice)
+    .sort((a, b) => b.confidence - a.confidence)[0]
+  const unitLabelPass = [...passes].filter(pass => pass.parsed.unitLabel)
+    .sort((a, b) => b.confidence - a.confidence)[0]
+  const candidatePrice = [...passes].flatMap(pass => {
+    if (!pass.parsed.price) return []
+    const explicitDecimal = pass.text.split(/[\r\n]+/).some(line => amountsIn(line).some(amount =>
+      amount.value === pass.parsed.price && /[.,]\d{1,2}/.test(amount.raw),
+    ))
+    const geometrySupported = pass.priceHeight >= 80
+    return explicitDecimal || geometrySupported ? [{ value: pass.parsed.price, explicitDecimal, geometrySupported, confidence: pass.confidence }] : []
+  }).sort((a, b) => Number(b.geometrySupported) - Number(a.geometrySupported)
+    || Number(b.explicitDecimal) - Number(a.explicitDecimal) || b.confidence - a.confidence)[0]
+
+  const merged: ParsedOcr = {
+    name: namePass?.parsed.name ?? best.parsed.name,
+    price: candidatePrice?.value ?? best.parsed.price,
+    unitPrice: unitPricePass?.parsed.unitPrice || best.parsed.unitPrice,
+    unitLabel: unitLabelPass?.parsed.unitLabel || best.parsed.unitLabel,
+  }
+  Object.assign(merged, sanitizeMergedFields(merged, passes))
+
+  const hasPrintedUnitDecimals = passes.some(pass => pass.parsed.unitLabel
+    && new RegExp(`\\d+[.,]\\d{1,2}\\s*(?:€\\s*)?\\/?\\s*(?:${pass.parsed.unitLabel === 'kg' ? 'kg' : 'l|lt'})\\b`, 'i').test(pass.text))
+  const hasExplicitUnitCue = passes.some(pass => /(?:€\s*\/\s*(?:kg|l|lt)\b|\/\s*(?:kg|l|lt)\b|\bper\s*(?:kg|l|lt)\b|\bpor\s*(?:kg|l|lt)\b)/i.test(pass.text))
+  const isLooseProducePrice = passes.some(pass => /(?:^|\n)\s*(?:€\s*)?\/\s*kg\b/i.test(pass.text))
+  if (merged.price && merged.unitLabel && hasExplicitUnitCue && !hasPrintedUnitDecimals && isLooseProducePrice) merged.unitPrice = merged.price
+
+  const packageLayout = passes.find(pass => pass.packageSize)?.layoutLines ?? []
+  const inferredPrice = shelfPriceFromUnit(merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
+  const relativePriceDifference = Math.abs(Number(merged.price) - Number(inferredPrice)) / Math.max(Number(merged.price), Number(inferredPrice))
+  const isWholeNumberPartial = Boolean(merged.price) && Number(merged.price) >= 10 && Number.isInteger(Number(merged.price))
+  if (inferredPrice && (!merged.price || isWholeNumberPartial || relativePriceDifference <= 0.25)) merged.price = inferredPrice
+  merged.unitPrice = correctUnitPrice(merged.price, merged.unitPrice, merged.unitLabel, merged.name, packageLayout)
+
+  return {
+    ...merged,
+    photo: prepared.photo,
+    recognizedText: passes.map(pass => pass.text).filter(Boolean).join('\n'),
+    confidence: best.confidence,
   }
 }
 
 export function progressMessage(status: string, progress: number): string {
-  if (status.includes('language')) return 'A carregar os modelos de português e inglês…'
+  if (status.includes('language')) return 'A carregar o modelo de português…'
   if (status.includes('core') || status.includes('worker')) return 'A iniciar o motor de leitura…'
+  const attempt = status.match(/recognizing text \((\d+)\/(\d+)\)/)
+  if (attempt) return `A ler a etiqueta — tentativa ${attempt[1]} de ${attempt[2]}…`
   if (status.includes('cropping')) return 'A focar a etiqueta para ler melhor…'
   if (status.includes('enhancing')) return 'A melhorar a imagem para ler a etiqueta…'
   if (status.includes('sparse')) return 'A procurar texto em diferentes zonas da etiqueta…'

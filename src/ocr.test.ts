@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseOcr } from './ocr'
+import { parseOcr, shouldRetryOcr } from './ocr'
 
 describe('parseOcr', () => {
   it('extracts product, shelf price and unit price from a Portuguese label', () => {
@@ -255,5 +255,23 @@ describe('parseOcr', () => {
 
   it('ignores store boilerplate instead of suggesting it as an item name', () => {
     expect(parseOcr('OBRIGADO PELA VISITA\nPVP RECOMENDADO')).toEqual({ name: '', price: '', unitPrice: '', unitLabel: '' })
+  })
+})
+
+describe('OCR retry policy', () => {
+  it('stops as soon as the product name and shelf price are available', () => {
+    expect(shouldRetryOcr([{ name: 'LEITE GORDO', price: '0.99', unitPrice: '', unitLabel: '', confidence: 78 }])).toBe(false)
+    expect(shouldRetryOcr([{ name: 'LEITE GORDO', price: '0.99', unitPrice: '', unitLabel: '', confidence: 42 }])).toBe(true)
+  })
+
+  it('allows partial results one more pass, but never exceeds two passes', () => {
+    expect(shouldRetryOcr([{ name: 'LEITE GORDO', price: '', unitPrice: '', unitLabel: '', confidence: 80 }])).toBe(true)
+    expect(shouldRetryOcr([
+      { name: '', price: '0.99', unitPrice: '', unitLabel: '', confidence: 50 },
+    ])).toBe(true)
+    expect(shouldRetryOcr([
+      { name: '', price: '', unitPrice: '', unitLabel: '', confidence: 80 },
+      { name: '', price: '', unitPrice: '', unitLabel: '', confidence: 80 },
+    ])).toBe(false)
   })
 })
